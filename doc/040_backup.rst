@@ -753,6 +753,49 @@ the pipe and act accordingly (e.g., remove the last backup). Refer to the
 `Use the Unofficial Bash Strict Mode <http://redsymbol.net/articles/unofficial-bash-strict-mode/>`__
 for more details on this.
 
+Backup from a zip archive
+*************************
+
+Restic can back up the contents of a ``.zip`` archive directly, without
+extracting it to disk first. Use the ``--migrate`` option of the ``backup``
+command and pass the path to the archive:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo backup --migrate /path/to/archive.zip
+
+This creates a new snapshot whose contents correspond to the entries of the
+zip archive. The paths inside the archive are preserved, so ``restic ls``
+lists the same entries that ``unzip -l`` shows, and ``restic restore``
+reproduces them byte for byte, including permissions and modification
+times.
+
+Only the archive itself is read: entry contents are decompressed on the
+fly while the backup runs, so memory usage stays bounded no matter how
+large the archive is. The archive is validated before the repository is
+opened, so a missing or unreadable archive fails the backup without
+touching the repository.
+
+Notes and limitations:
+
+* ``--migrate`` behaves like ``--force``: the archive is read fully, so no
+  parent snapshot is searched for or used. The option cannot be combined
+  with ``--parent``, with positional file or directory arguments, with
+  ``--stdin`` / ``--stdin-from-command``, or with the ``--files-from``
+  options.
+* Permissions are preserved when the archive was created on Unix or
+  macOS; for archives created elsewhere, files are stored with mode
+  ``0644`` and directories with mode ``0755``. The zip format only stores
+  timestamps with one-second precision, so sub-second precision is lost.
+* Symbolic links contained in the archive are backed up as symbolic links.
+  Other special file types (FIFOs, sockets, device nodes) are skipped with
+  a warning.
+* Encrypted entries, entries with unsupported compression methods, and
+  entries whose names are unsafe or would escape the archive root are
+  skipped with a warning.
+* The ``--exclude``, ``--tag``, ``--time`` and ``--dry-run`` options work
+  as usual with ``--migrate``.
+
 Tags for backup
 ***************
 
