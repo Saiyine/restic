@@ -549,7 +549,9 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		if err != nil {
 			return err
 		}
-		defer zipFS.Close()
+		defer func() {
+			_ = zipFS.Close()
+		}()
 	}
 
 	success := true

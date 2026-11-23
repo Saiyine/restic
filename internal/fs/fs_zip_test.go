@@ -43,7 +43,7 @@ func writeTestZip(t testing.TB, zipPath string, files []zipTestFile) {
 		}
 		hdr := &zip.FileHeader{Name: file.name, Method: method}
 		if !file.modTime.IsZero() {
-			hdr.SetModTime(file.modTime)
+			hdr.Modified = file.modTime.UTC()
 		}
 		if file.mode != 0 {
 			hdr.SetMode(file.mode)
@@ -273,40 +273,6 @@ func TestZipCP437Name(t *testing.T) {
 	test.Equals(t, "café", readWholeFile(t, z, "/é.txt"))
 }
 
-func markZipCentralAndLocalFlag(t testing.TB, zipPath string, entryIdx int, mask byte, set bool) {
-	t.Helper()
-	data, err := os.ReadFile(zipPath)
-	test.OK(t, err)
-
-	// find the central directory record for the given entry
-	offset := 0
-	found := 0
-	for {
-		next := bytes.Index(data[offset:], []byte("PK\x01\x02"))
-		if next < 0 {
-			break
-		}
-		off := offset + next
-		if found == entryIdx {
-			flags := data[off+8]
-			if set {
-				flags |= mask
-			} else {
-				flags &^= mask
-			}
-			data[off+8] = flags
-			break
-		}
-		found++
-		offset = off + 1
-	}
-	test.Assert(t, found == entryIdx, "central directory entry %d not found", entryIdx)
-
-	// find the local header for the same entry (match by file name)
-	// the entry names are unique in the test zips, so find them directly
-	test.OK(t, os.WriteFile(zipPath, data, 0o644))
-}
-
 func TestZipEncryptedEntryIsSkipped(t *testing.T) {
 	dir := t.TempDir()
 	zipPath := filepath.Join(dir, "enc.zip")
@@ -366,7 +332,9 @@ func TestZipCorruptContent(t *testing.T) {
 
 	f, err := z.OpenFile("/data.bin", O_RDONLY, false)
 	test.OK(t, err)
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 	_, err = io.ReadAll(f)
 	test.Assert(t, errors.Is(err, zip.ErrChecksum), "expected checksum error, got %v", err)
 }

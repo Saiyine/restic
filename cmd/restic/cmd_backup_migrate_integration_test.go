@@ -63,7 +63,7 @@ func makeTestZip(t testing.TB, srcDir, zipPath string) {
 			rtest.OK(t, err)
 			f, err := os.Open(path)
 			rtest.OK(t, err)
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			_, err = io.Copy(w, f)
 			rtest.OK(t, err)
 		}

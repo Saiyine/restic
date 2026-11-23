@@ -307,7 +307,9 @@ func readSymlinkTarget(fh *zip.File) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer rc.Close()
+	defer func() {
+		_ = rc.Close()
+	}()
 
 	target, err := io.ReadAll(io.LimitReader(rc, maxSymlinkTargetLen+1))
 	if err != nil {
