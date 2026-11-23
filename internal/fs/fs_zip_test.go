@@ -3,6 +3,7 @@ package fs
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -339,6 +340,30 @@ func TestZipCorruptContent(t *testing.T) {
 	test.Assert(t, errors.Is(err, zip.ErrChecksum), "expected checksum error, got %v", err)
 }
 
+// TestZipZip64Sizes verifies that entries whose sizes or header offset
+// overflow the 32-bit fields are read correctly when the real values are
+// carried in the zip64 extended information extra field.
+func TestZipZip64Sizes(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "zip64.zip")
+	const fname = "big.bin"
+	content := bytes.Repeat([]byte("zip64 test content "), 32)
+	writeTestZip(t, zipPath, []zipTestFile{
+		{name: fname, content: content},
+	})
+	patchZip64Central(t, zipPath, fname)
+
+	var warnings []string
+	z := openTestZip(t, zipPath, &warnings)
+	test.Assert(t, len(warnings) == 0, "unexpected warnings: %v", warnings)
+
+	fi, err := z.Lstat("/" + fname)
+	test.OK(t, err)
+	test.Equals(t, int64(len(content)), fi.Size)
+
+	test.Equals(t, string(content), readWholeFile(t, z, "/"+fname))
+}
+
 func TestZipConcurrentRead(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("not supported on windows")
@@ -555,6 +580,59 @@ func patchZipEntryMethod(t testing.TB, zipPath, name string, method uint16) {
 	}
 	patch([]byte("PK\x03\x04"), 8, 26, 30)
 	patch([]byte("PK\x01\x02"), 10, 28, 46)
+
+	test.OK(t, os.WriteFile(zipPath, data, 0o644))
+}
+
+// patchZip64Central marks the named entry's central directory record as
+// zip64: it sets the compressed size, uncompressed size and local header
+// offset fields to 0xFFFFFFFF and appends a zip64 extended information
+// extra field with the real values. The local file header keeps its real
+// 32-bit sizes, which is a valid combination.
+func patchZip64Central(t testing.TB, zipPath, name string) {
+	t.Helper()
+	data, err := os.ReadFile(zipPath)
+	test.OK(t, err)
+
+	nameBytes := []byte(name)
+	start, nlen := -1, 0
+	off := 0
+	for {
+		idx := bytes.Index(data[off:], []byte("PK\x01\x02"))
+		if idx < 0 {
+			break
+		}
+		cand := off + idx
+		candNlen := int(data[cand+28]) | int(data[cand+29])<<8
+		if candNlen == len(nameBytes) && bytes.Equal(data[cand+46:cand+46+candNlen], nameBytes) {
+			start, nlen = cand, candNlen
+			break
+		}
+		off = cand + 4
+	}
+	test.Assert(t, start >= 0, "central directory record for %q not found", name)
+
+	xlen := int(data[start+30]) | int(data[start+31])<<8
+	clen := int(data[start+32]) | int(data[start+33])<<8
+	test.Equals(t, 0, clen, "entry must not have a zip comment")
+	compSize := uint64(binary.LittleEndian.Uint32(data[start+20 : start+24]))
+	uncompSize := uint64(binary.LittleEndian.Uint32(data[start+24 : start+28]))
+	headerOffset := uint64(binary.LittleEndian.Uint32(data[start+42 : start+46]))
+
+	for _, f := range []int{20, 24, 42} {
+		binary.LittleEndian.PutUint32(data[start+f:start+f+4], ^uint32(0))
+	}
+
+	extra := make([]byte, 4+24)
+	binary.LittleEndian.PutUint16(extra[0:2], 0x0001)
+	binary.LittleEndian.PutUint16(extra[2:4], 24)
+	binary.LittleEndian.PutUint64(extra[4:12], uncompSize)
+	binary.LittleEndian.PutUint64(extra[12:20], compSize)
+	binary.LittleEndian.PutUint64(extra[20:28], headerOffset)
+
+	pos := start + 46 + nlen + xlen
+	data = append(data[:pos], append(extra, data[pos:]...)...)
+	binary.LittleEndian.PutUint16(data[start+30:start+32], uint16(xlen+len(extra)))
 
 	test.OK(t, os.WriteFile(zipPath, data, 0o644))
 }
