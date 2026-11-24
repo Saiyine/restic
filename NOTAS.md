@@ -177,3 +177,21 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
   idéntico byte a byte (modos y mtimes incluidos); en `/tmp` solo existieron repo,
   cache y target de restore → cero ficheros temporales.
 - Pendiente: nada. Criterios del §7 todos verificados.
+
+### A7 — `--migrate` repetible (varios zips)
+
+- Qué hice: `--migrate` ahora se puede especificar varias veces
+  (`Migrate []string`, flag `StringArrayVar`). `fs.NewZip` delega en el nuevo
+  `fs.NewZipMulti(zipPaths, warnf)`, que abre todos los archivos, concatena sus
+  entradas en orden y las indexa con la MISMA lógica que ya existía (`addEntry`):
+  duplicado mismo tipo → gana el último (zip posterior) + warning; colisión
+  fichero/directorio → gana la primera + warning. `Zip.rzs []*zip.ReadCloser`
+  (antes `rc`); `Close()` cierra todos. CLI: validación de elementos vacíos y
+  de duplicados en `Check()`.
+- Decisiones: semántica de "concatenación de entradas" (no hay reglas nuevas,
+  reutiliza el comportamiento de duplicados/colisiones de un solo zip); sin
+  env var (igual que `--exclude-if-present`, `StringArrayVar` no la soporta).
+- Tests: 4 unitarios nuevos (`TestZipMulti{Disjoint,DuplicateLastWins,TypeConflict,OpenError}`)
+  e integración `TestBackupMigrateMultipleArchives` (unión + último-gana,
+  restore comparado con el árbol esperado fusionado).
+- Docs/changelog actualizados; pendientes: QA completo y PR.

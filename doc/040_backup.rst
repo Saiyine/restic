@@ -756,33 +756,47 @@ for more details on this.
 Backup from a zip archive
 *************************
 
-Restic can back up the contents of a ``.zip`` archive directly, without
-extracting it to disk first. Use the ``--migrate`` option of the ``backup``
-command and pass the path to the archive:
+Restic can back up the contents of one or more ``.zip`` archives
+directly, without extracting them to disk first. Use the ``--migrate``
+option of the ``backup`` command and pass the path(s) to the archive(s):
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo backup --migrate /path/to/archive.zip
 
-This creates a new snapshot whose contents correspond to the entries of the
-zip archive. The paths inside the archive are preserved, so ``restic ls``
-lists the same entries that ``unzip -l`` shows, and ``restic restore``
-reproduces them byte for byte, including permissions and modification
-times.
+The option can be specified multiple times to merge several archives into
+a single snapshot:
 
-Only the archive itself is read: entry contents are decompressed on the
-fly while the backup runs, so memory usage stays bounded no matter how
-large the archive is. The archive is validated before the repository is
-opened, so a missing or unreadable archive fails the backup without
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo backup --migrate /path/to/a.zip --migrate /path/to/b.zip
+
+This creates a new snapshot whose contents correspond to the entries of
+the zip archive(s). The paths inside the archives are preserved, so
+``restic ls`` lists the same entries that ``unzip -l`` shows, and
+``restic restore`` reproduces them byte for byte, including permissions
+and modification times.
+
+When several archives are given, the entries of all archives are merged
+at the same root, in the order the archives are listed. If the same path
+occurs in more than one archive with the same type, the entry of the
+later archive is used (with a warning); if a path is a file in one
+archive and a directory in another, the first occurrence is kept and the
+conflicting entry is skipped with a warning.
+
+Only the archives themselves are read: entry contents are decompressed on
+the fly while the backup runs, so memory usage stays bounded no matter how
+large the archives are. The archives are validated before the repository
+is opened, so a missing or unreadable archive fails the backup without
 touching the repository.
 
 Notes and limitations:
 
-* ``--migrate`` behaves like ``--force``: the archive is read fully, so no
-  parent snapshot is searched for or used. The option cannot be combined
-  with ``--parent``, with positional file or directory arguments, with
-  ``--stdin`` / ``--stdin-from-command``, or with the ``--files-from``
-  options.
+* ``--migrate`` behaves like ``--force``: the archives are read fully, so
+  no parent snapshot is searched for or used. The option cannot be
+  combined with ``--parent``, with positional file or directory
+  arguments, with ``--stdin`` / ``--stdin-from-command``, or with the
+  ``--files-from`` options. The same archive cannot be listed twice.
 * Permissions are preserved when the archive was created on Unix or
   macOS; for archives created elsewhere, files are stored with mode
   ``0644`` and directories with mode ``0755``. The zip format only stores
