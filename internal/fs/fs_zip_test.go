@@ -58,7 +58,7 @@ func writeTestZip(t testing.TB, zipPath string, files []zipTestFile) {
 	test.OK(t, f.Close())
 }
 
-func openTestZip(t testing.TB, zipPath string, warnings *[]string) *Zip {
+func openTestZip(t testing.TB, zipPath string, warnings *[]string) *MigrateFS {
 	t.Helper()
 	z, err := NewZip(zipPath, func(format string, args ...any) {
 		*warnings = append(*warnings, fmt.Sprintf(format, args...))
@@ -68,7 +68,7 @@ func openTestZip(t testing.TB, zipPath string, warnings *[]string) *Zip {
 	return z
 }
 
-func readWholeFile(t testing.TB, z *Zip, name string) string {
+func readWholeFile(t testing.TB, z *MigrateFS, name string) string {
 	t.Helper()
 	f, err := z.OpenFile(name, O_RDONLY|O_NOFOLLOW, false)
 	test.OK(t, err)
@@ -510,7 +510,7 @@ func TestZipLstatConsistency(t *testing.T) {
 	test.Assert(t, count >= 4, "expected at least 4 entries, walked %d", count)
 }
 
-func openTestZipMulti(t testing.TB, zipPaths []string, warnings *[]string) *Zip {
+func openTestZipMulti(t testing.TB, zipPaths []string, warnings *[]string) *MigrateFS {
 	t.Helper()
 	z, err := NewZipMulti(zipPaths, func(format string, args ...any) {
 		*warnings = append(*warnings, fmt.Sprintf(format, args...))

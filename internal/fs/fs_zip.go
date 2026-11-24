@@ -3,17 +3,9 @@ package fs
 import (
 	"archive/zip"
 	"errors"
-	"fmt"
-	"io"
 	"os"
 	"path"
-	"slices"
 	"strings"
-	"syscall"
-	"time"
-	"unicode/utf8"
-
-	"github.com/restic/restic/internal/data"
 )
 
 // zipCreatorUnix and zipCreatorMacOSX mirror the creator-version values used
@@ -22,10 +14,6 @@ const (
 	zipCreatorUnix   = 3
 	zipCreatorMacOSX = 19
 )
-
-// maxSymlinkTargetLen caps how large a symlink entry's content may be before
-// it is no longer treated as a symlink (PATH_MAX on Linux is 4096).
-const maxSymlinkTargetLen = 4096
 
 // zipEncryptedFlag is bit 0 of the zip general-purpose flag word.
 const zipEncryptedFlag = 1 << 0
@@ -67,31 +55,14 @@ func cp437Decode(raw string) string {
 	return b.String()
 }
 
-// zipEntry is one entry of the in-memory index of a Zip filesystem.
-type zipEntry struct {
-	path     string // absolute path within the virtual root, e.g. "/dir/file.txt"
-	isDir    bool
-	implicit bool // synthesized directory, not present in the archive itself
-
-	header     *zip.File
-	linkTarget string // only for symlinks
-	fi         *ExtendedFileInfo
-}
-
-// Zip is a read-only filesystem view over the entries of one or more .zip
-// archives. It implements FS so that the archiver can back up the archives'
-// contents in place: entry content is decompressed on the fly and nothing is
-// ever extracted to disk. Concurrent OpenFile calls are safe: every opened
-// file gets its own decompressor over the (concurrency-safe) io.ReaderAt of
-// the underlying archive file, and no state is shared between Files.
-type Zip struct {
-	rzs []*zip.ReadCloser
-
-	entries  map[string]*zipEntry
-	children map[string][]string // dir path -> sorted child names
-
-	warn   func(format string, args ...any)
-	closed bool
+// zipCleanEntryName normalizes a raw zip entry name to an absolute path
+// within the virtual root. Non-UTF-8 names are decoded from CP437 first; the
+// rest of the sanitization is shared with the other archive formats.
+func zipCleanEntryName(raw string, nonUTF8 bool) (string, bool) {
+	if nonUTF8 {
+		raw = cp437Decode(raw)
+	}
+	return archiveCleanEntryName(raw)
 }
 
 // NewZip opens the zip archive at zipPath and indexes its central directory.
@@ -99,7 +70,7 @@ type Zip struct {
 // small content of symlink entries). Entries whose names cannot be made safe
 // (escaping the virtual root, NUL bytes, ...), or that are encrypted or use
 // an unsupported compression method, are skipped with a warning via warnf.
-func NewZip(zipPath string, warnf func(format string, args ...any)) (*Zip, error) {
+func NewZip(zipPath string, warnf func(format string, args ...any)) (*MigrateFS, error) {
 	return NewZipMulti([]string{zipPath}, warnf)
 }
 
@@ -110,147 +81,60 @@ func NewZip(zipPath string, warnf func(format string, args ...any)) (*Zip, error
 // to the concatenated entries (duplicate paths of the same type keep the
 // last entry, entries conflicting with an existing entry of a different
 // type are skipped with a warning). Like NewZip, nothing is extracted to
-// disk. All archives stay open until the returned Zip is closed.
-func NewZipMulti(zipPaths []string, warnf func(format string, args ...any)) (*Zip, error) {
+// disk. All archives stay open until the returned MigrateFS is closed.
+func NewZipMulti(zipPaths []string, warnf func(format string, args ...any)) (*MigrateFS, error) {
 	if len(zipPaths) == 0 {
 		return nil, errors.New("no zip archives given")
 	}
 
-	if warnf == nil {
-		warnf = func(string, ...any) {}
-	}
-
-	rzs := make([]*zip.ReadCloser, len(zipPaths))
-	capEntries := 0
-	for i, p := range zipPaths {
+	m := newMigrateFS(warnf, 0)
+	for _, p := range zipPaths {
 		zr, err := zip.OpenReader(p)
 		if err != nil {
-			for _, r := range rzs[:i] {
-				_ = r.Close()
-			}
+			_ = m.Close()
 			return nil, err
 		}
-		rzs[i] = zr
-		capEntries += len(zr.File)
-	}
-
-	z := &Zip{
-		rzs:      rzs,
-		entries:  make(map[string]*zipEntry, capEntries),
-		children: make(map[string][]string),
-		warn:     warnf,
-	}
-
-	for _, zr := range rzs {
+		m.addCloser(zr.Close)
 		for _, fh := range zr.File {
-			z.indexEntry(fh)
+			m.indexZipEntry(fh)
 		}
 	}
 
-	// Synthesize the directories implied by file paths but not present in
-	// the archive (like `unzip` does), plus the virtual root itself.
-	for p, e := range z.entries {
-		if e.isDir {
-			continue
-		}
-		for dir := path.Dir(p); dir != "/"; dir = path.Dir(dir) {
-			if _, ok := z.entries[dir]; ok {
-				break
-			}
-			z.entries[dir] = &zipEntry{
-				path:     dir,
-				isDir:    true,
-				implicit: true,
-				fi: &ExtendedFileInfo{
-					Name: path.Base(dir),
-					Mode: os.ModeDir | 0o755,
-				},
-			}
-			z.children[path.Dir(dir)] = append(z.children[path.Dir(dir)], path.Base(dir))
-		}
-	}
-	z.entries["/"] = &zipEntry{
-		path:     "/",
-		isDir:    true,
-		implicit: true,
-		fi:       &ExtendedFileInfo{Name: "/", Mode: os.ModeDir | 0o755},
-	}
-
-	// An implicit directory's mtime is the most recent of its descendants,
-	// computed deepest-first so that child directories are resolved first.
-	var dirPaths []string
-	for p, e := range z.entries {
-		if e.isDir {
-			dirPaths = append(dirPaths, p)
-		}
-	}
-	slices.SortFunc(dirPaths, func(a, b string) int {
-		da, db := strings.Count(a, "/"), strings.Count(b, "/")
-		if da != db {
-			return db - da
-		}
-		return strings.Compare(a, b)
-	})
-	for _, p := range dirPaths {
-		e := z.entries[p]
-		if !e.implicit {
-			continue
-		}
-		var latest time.Time
-		for _, name := range z.children[p] {
-			if t := z.entries[path.Join(p, name)].fi.ModTime; t.After(latest) {
-				latest = t
-			}
-		}
-		e.fi.ModTime = latest
-		e.fi.AccessTime = latest
-		e.fi.ChangeTime = latest
-	}
-
-	for _, names := range z.children {
-		slices.Sort(names)
-	}
-
-	return z, nil
+	m.finalize()
+	return m, nil
 }
 
-// Close closes the underlying zip archives.
-func (z *Zip) Close() error {
-	if z.closed {
-		return nil
+// openZipArchive opens the zip archive at path and indexes its entries into
+// m. Used by NewMigrate, which probes the format first.
+func (m *MigrateFS) openZipArchive(path string) error {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return err
 	}
-	z.closed = true
-	var err error
-	for _, rz := range z.rzs {
-		err = errors.Join(err, rz.Close())
+	m.addCloser(zr.Close)
+	for _, fh := range zr.File {
+		m.indexZipEntry(fh)
 	}
-	return err
+	return nil
 }
 
-// zipCleanPath maps a name to its absolute form within the virtual
-// filesystem. All paths are relative to the virtual root and use "/" as
-// separator on every platform.
-func zipCleanPath(name string) string {
-	return path.Clean("/" + name)
-}
-
-// indexEntry validates one archive entry and indexes it if usable. Entries
+// indexZipEntry validates one zip entry and indexes it if usable. Entries
 // whose names cannot be made safe (escaping the virtual root, NUL bytes,
 // ...), or that are encrypted or use an unsupported compression method, are
 // skipped with a warning.
-func (z *Zip) indexEntry(fh *zip.File) {
+func (m *MigrateFS) indexZipEntry(fh *zip.File) {
 	name, ok := zipCleanEntryName(fh.Name, fh.NonUTF8)
 	if !ok {
-		z.warn("zip: entry %q ignored, unsafe or invalid path", fh.Name)
+		m.warn("zip: entry %q ignored, unsafe or invalid path", fh.Name)
 		return
 	}
 
 	if fh.Flags&zipEncryptedFlag != 0 {
-		z.warn("zip: entry %q ignored, entry is encrypted", fh.Name)
+		m.warn("zip: entry %q ignored, entry is encrypted", fh.Name)
 		return
 	}
 	if fh.Method != zip.Store && fh.Method != zip.Deflate {
-		z.warn("zip: entry %q ignored, unsupported compression method %d", fh.Name, fh.Method)
+		m.warn("zip: entry %q ignored, unsupported compression method %d", fh.Name, fh.Method)
 		return
 	}
 
@@ -259,10 +143,10 @@ func (z *Zip) indexEntry(fh *zip.File) {
 	isSymlink := mode&os.ModeSymlink != 0
 
 	mtime := fh.Modified.UTC()
-	e := &zipEntry{
-		path:   name,
-		isDir:  isDir,
-		header: fh,
+	e := &archiveEntry{
+		path:  name,
+		isDir: isDir,
+		label: "zip",
 		fi: &ExtendedFileInfo{
 			Name:       path.Base(name),
 			ModTime:    mtime,
@@ -271,9 +155,9 @@ func (z *Zip) indexEntry(fh *zip.File) {
 		},
 	}
 	if isSymlink {
-		target, err := readSymlinkTarget(fh)
+		target, err := readLinkTarget(fh.UncompressedSize64, fh.Open)
 		if err != nil {
-			z.warn("zip: entry %q ignored: %v", fh.Name, err)
+			m.warn("zip: entry %q ignored: %v", fh.Name, err)
 			return
 		}
 		e.linkTarget = target
@@ -283,81 +167,11 @@ func (z *Zip) indexEntry(fh *zip.File) {
 		e.fi.Mode = zipEntryMode(fh, isDir)
 		if !isDir {
 			e.fi.Size = int64(fh.UncompressedSize64)
+			e.content = fh.Open
 		}
 	}
 
-	z.addEntry(e)
-}
-
-// zipCleanEntryName normalizes a raw zip entry name to an absolute path
-// within the virtual root. It converts backslashes (Windows-made archives)
-// to slashes, strips leading separators and Windows drive letters, removes
-// "." components and resolves ".." components. It reports whether the name
-// is usable: names containing NUL bytes or escaping the virtual root
-// (zip-slip) are rejected.
-func zipCleanEntryName(raw string, nonUTF8 bool) (string, bool) {
-	if nonUTF8 {
-		raw = cp437Decode(raw)
-	}
-
-	if strings.ContainsRune(raw, '\x00') {
-		return "", false
-	}
-
-	name := strings.ReplaceAll(raw, "\\", "/")
-	name = strings.TrimPrefix(name, "/")
-	// strip a leading drive letter like "C:" from Windows-made archives
-	if len(name) >= 2 && name[1] == ':' {
-		if c := name[0]; (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			name = name[2:]
-		}
-	}
-
-	parts := make([]string, 0, 8)
-	for _, part := range strings.Split(name, "/") {
-		switch part {
-		case "", ".":
-			// nothing to do
-		case "..":
-			if len(parts) == 0 {
-				return "", false // would escape the virtual root
-			}
-			parts = parts[:len(parts)-1]
-		default:
-			parts = append(parts, part)
-		}
-	}
-
-	if len(parts) == 0 {
-		return "", false // entry points at the root itself
-	}
-	return "/" + strings.Join(parts, "/"), true
-}
-
-// readSymlinkTarget reads the content of a symlink entry, which is the link
-// target. It returns an error if the target is longer than
-// maxSymlinkTargetLen or cannot be read.
-func readSymlinkTarget(fh *zip.File) (string, error) {
-	if fh.UncompressedSize64 > maxSymlinkTargetLen {
-		return "", fmt.Errorf("symlink target too long (%d bytes)", fh.UncompressedSize64)
-	}
-	rc, err := fh.Open()
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		_ = rc.Close()
-	}()
-
-	target, err := io.ReadAll(io.LimitReader(rc, maxSymlinkTargetLen+1))
-	if err != nil {
-		return "", err
-	}
-	if len(target) > maxSymlinkTargetLen {
-		return "", fmt.Errorf("symlink target too long (%d bytes)", len(target))
-	}
-	// some tools NUL-terminate the target (a tar convention)
-	return strings.TrimSuffix(string(target), "\x00"), nil
+	m.addEntry(e)
 }
 
 // zipEntryMode returns the permission bits to store for an entry. Archives
@@ -371,259 +185,4 @@ func zipEntryMode(fh *zip.File, isDir bool) os.FileMode {
 		return os.ModeDir | 0o755
 	}
 	return 0o644
-}
-
-// addEntry indexes e. A second entry with the same path and same type
-// replaces the first one (last one wins, like `unzip -o`); an entry whose
-// path conflicts with an existing entry of a different type, or that would
-// live inside a regular file, is rejected.
-func (z *Zip) addEntry(e *zipEntry) bool {
-	if prev, ok := z.entries[e.path]; ok {
-		if prev.isDir != e.isDir {
-			z.warn("zip: entry %q ignored, name conflicts with existing %s", e.path, kindOf(prev))
-			return false
-		}
-		z.warn("zip: duplicate entry %q, keeping the last one", e.path)
-	}
-
-	// the path must not cross an existing regular file or symlink
-	for dir := path.Dir(e.path); dir != "/"; dir = path.Dir(dir) {
-		if p, ok := z.entries[dir]; ok && !p.isDir {
-			z.warn("zip: entry %q ignored, parent %q is not a directory", e.path, dir)
-			return false
-		}
-	}
-
-	if _, ok := z.entries[e.path]; !ok {
-		z.children[path.Dir(e.path)] = append(z.children[path.Dir(e.path)], path.Base(e.path))
-	}
-	z.entries[e.path] = e
-	return true
-}
-
-func kindOf(e *zipEntry) string {
-	switch {
-	case e.isDir:
-		return "directory"
-	case e.fi.Mode&os.ModeSymlink != 0:
-		return "symlink"
-	default:
-		return "file"
-	}
-}
-
-// OpenFile implements FS.
-func (z *Zip) OpenFile(name string, flag int, _ bool) (File, error) {
-	if flag&^(O_RDONLY|O_NOFOLLOW|O_DIRECTORY) != 0 {
-		return nil, pathError("open", name, fmt.Errorf("invalid combination of flags 0x%x", flag))
-	}
-
-	if z.closed {
-		return nil, pathError("open", name, os.ErrClosed)
-	}
-
-	name = zipCleanPath(name)
-	e, ok := z.entries[name]
-	if !ok {
-		return nil, pathError("open", name, syscall.ENOENT)
-	}
-	if flag&O_DIRECTORY != 0 && !e.isDir {
-		return nil, pathError("open", name, syscall.ENOTDIR)
-	}
-
-	if e.isDir {
-		return &zipDir{
-			name:  name,
-			fi:    e.fi,
-			names: slices.Clone(z.children[name]),
-		}, nil
-	}
-	return &zipFile{
-		name:  name,
-		entry: e,
-	}, nil
-}
-
-// Lstat implements FS.
-func (z *Zip) Lstat(name string) (*ExtendedFileInfo, error) {
-	name = zipCleanPath(name)
-	e, ok := z.entries[name]
-	if !ok {
-		return nil, pathError("lstat", name, os.ErrNotExist)
-	}
-	return e.fi, nil
-}
-
-// Join implements FS.
-func (z *Zip) Join(elem ...string) string {
-	return path.Join(elem...)
-}
-
-// Separator implements FS.
-func (z *Zip) Separator() string {
-	return "/"
-}
-
-// IsAbs implements FS.
-func (z *Zip) IsAbs(p string) bool {
-	return path.IsAbs(p)
-}
-
-// Abs implements FS.
-func (z *Zip) Abs(p string) (string, error) {
-	return zipCleanPath(p), nil
-}
-
-// Clean implements FS.
-func (z *Zip) Clean(p string) string {
-	return path.Clean(p)
-}
-
-// VolumeName implements FS. The virtual filesystem has no volumes.
-func (z *Zip) VolumeName(string) string {
-	return ""
-}
-
-// Dir implements FS.
-func (z *Zip) Dir(p string) string {
-	return path.Dir(p)
-}
-
-// Base implements FS.
-func (z *Zip) Base(p string) string {
-	return path.Base(p)
-}
-
-// nodeFromEntry builds the data.Node for a zip entry. The metadata comes
-// from the in-memory central directory index, so Stat() and ToNode() are
-// always consistent.
-func nodeFromEntry(name string, e *zipEntry) *data.Node {
-	node := buildBasicNode(name, e.fi)
-	node.AccessTime = e.fi.ModTime
-	node.ChangeTime = e.fi.ModTime
-	if e.fi.Mode&os.ModeSymlink != 0 {
-		node.LinkTarget = e.linkTarget
-		if !utf8.ValidString(e.linkTarget) {
-			node.LinkTargetRaw = []byte(e.linkTarget)
-		}
-	}
-	return node
-}
-
-// zipFile is a File backed by a single zip entry. The content is decompressed
-// on the fly from the archive; nothing is written to disk.
-type zipFile struct {
-	name  string
-	entry *zipEntry
-
-	rc io.ReadCloser // lazily opened on first read
-}
-
-// statically ensure that zipFile implements File.
-var _ File = (*zipFile)(nil)
-
-// MakeReadable opens the (decompressing) reader for the entry's content. It
-// is a no-op for entries that have no content to read.
-func (f *zipFile) MakeReadable() error {
-	if f.rc != nil {
-		return nil
-	}
-
-	if f.entry.fi.Mode&os.ModeSymlink != 0 {
-		f.rc = io.NopCloser(strings.NewReader(f.entry.linkTarget))
-		return nil
-	}
-
-	rc, err := f.entry.header.Open()
-	if err != nil {
-		return pathError("open", f.name, err)
-	}
-	f.rc = rc
-	return nil
-}
-
-func (f *zipFile) reader() (io.ReadCloser, error) {
-	if f.rc == nil {
-		if err := f.MakeReadable(); err != nil {
-			return nil, err
-		}
-	}
-	return f.rc, nil
-}
-
-// Read implements io.Reader.
-func (f *zipFile) Read(p []byte) (int, error) {
-	rc, err := f.reader()
-	if err != nil {
-		return 0, err
-	}
-	return rc.Read(p)
-}
-
-// Close implements io.Closer.
-func (f *zipFile) Close() error {
-	if f.rc == nil {
-		return nil
-	}
-	err := f.rc.Close()
-	f.rc = nil
-	return err
-}
-
-// Readdirnames implements File.
-func (f *zipFile) Readdirnames(_ int) ([]string, error) {
-	return nil, pathError("readdirnames", f.name, os.ErrInvalid)
-}
-
-// Stat implements File.
-func (f *zipFile) Stat() (*ExtendedFileInfo, error) {
-	return f.entry.fi, nil
-}
-
-// ToNode implements File.
-func (f *zipFile) ToNode(_ bool, _ func(format string, args ...any)) (*data.Node, error) {
-	return nodeFromEntry(f.name, f.entry), nil
-}
-
-// zipDir is a directory of the virtual filesystem.
-type zipDir struct {
-	name  string
-	fi    *ExtendedFileInfo
-	names []string
-}
-
-// statically ensure that zipDir implements File.
-var _ File = (*zipDir)(nil)
-
-// MakeReadable implements File.
-func (d *zipDir) MakeReadable() error {
-	return nil
-}
-
-// Read implements io.Reader.
-func (d *zipDir) Read(_ []byte) (int, error) {
-	return 0, pathError("read", d.name, os.ErrInvalid)
-}
-
-// Close implements io.Closer.
-func (d *zipDir) Close() error {
-	return nil
-}
-
-// Readdirnames implements File.
-func (d *zipDir) Readdirnames(n int) ([]string, error) {
-	if n > 0 {
-		return nil, pathError("readdirnames", d.name, os.ErrInvalid)
-	}
-	return slices.Clone(d.names), nil
-}
-
-// Stat implements File.
-func (d *zipDir) Stat() (*ExtendedFileInfo, error) {
-	return d.fi, nil
-}
-
-// ToNode implements File.
-func (d *zipDir) ToNode(_ bool, _ func(format string, args ...any)) (*data.Node, error) {
-	return nodeFromEntry(d.name, &zipEntry{path: d.name, isDir: true, fi: d.fi}), nil
 }
