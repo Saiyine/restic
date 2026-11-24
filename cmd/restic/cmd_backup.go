@@ -116,7 +116,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
-	f.StringArrayVar(&opts.Migrate, "migrate", nil, "back up the contents of the given `zip` or `7z` archive(s) in place, without extracting them to disk (can be specified multiple times)")
+	f.StringArrayVar(&opts.Migrate, "migrate", nil, "back up the contents of the given `zip`, `7z` or `tar` archive(s) (tar optionally compressed with gzip or xz, plus standalone .gz/.xz files) in place, without extracting them to disk (can be specified multiple times)")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
 	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
@@ -435,7 +435,7 @@ func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf fu
 // collectTargets returns a list of target files/dirs from several sources.
 func collectTargets(opts BackupOptions, args []string, warnf func(msg string, args ...any), stdin io.ReadCloser) (targets []string, err error) {
 	if len(opts.Migrate) > 0 {
-		// the whole zip archive is the target; its root is the virtual "/"
+		// the whole archive is the target; its root is the virtual "/"
 		return []string{"/"}, nil
 	}
 
@@ -552,18 +552,18 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 
 	// validate the archives before opening the repository, so that a
 	// missing or unreadable archive fails fast without touching the repo
-	var zipFS *fs.MigrateFS
+	var migrateFS *fs.MigrateFS
 	if len(opts.Migrate) > 0 {
 		// archives have no meaningful parent snapshot: always read
 		// everything (behaves like --force)
 		opts.Force = true
 
-		zipFS, err = fs.NewMigrate(opts.Migrate, printer.E)
+		migrateFS, err = fs.NewMigrate(opts.Migrate, printer.E)
 		if err != nil {
 			return err
 		}
 		defer func() {
-			_ = zipFS.Close()
+			_ = migrateFS.Close()
 		}()
 	}
 
@@ -652,7 +652,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	}
 
 	if len(opts.Migrate) > 0 {
-		targetFS = zipFS
+		targetFS = migrateFS
 	}
 
 	if opts.Stdin || opts.StdinCommand {

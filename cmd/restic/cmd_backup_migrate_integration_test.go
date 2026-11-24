@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/ulikunitz/xz"
 )
 
 // makeTestSevenZip creates a 7z archive at outPath containing the content of
@@ -575,6 +578,186 @@ func TestBackupMigrateMixedZipSevenZip(t *testing.T) {
 	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
 	diff := directoriesContentsDiff(t, expected, restoredir)
 	rtest.Assert(t, diff == "", "restored content differs from the merged archives: %v", diff)
+
+	testRunCheck(t, env.gopts)
+}
+
+// makeTestTar creates a tar archive at tarPath containing the content of
+// srcDir with relative entry names (as `tar -cf out.tar -C srcDir .`),
+// preserving file modes and modification times. When format is "w:gz" or
+// "w:xz" the archive is compressed with gzip or xz.
+func makeTestTar(t testing.TB, srcDir, tarPath, format string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	err := filepath.WalkDir(srcDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		info, err := d.Info()
+		rtest.OK(t, err)
+		linkTarget := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err = os.Readlink(path)
+			rtest.OK(t, err)
+		}
+		hdr, err := tar.FileInfoHeader(info, linkTarget)
+		rtest.OK(t, err)
+		hdr.Name = filepath.ToSlash(rel)
+		if d.IsDir() {
+			hdr.Name += "/"
+		}
+		rtest.OK(t, w.WriteHeader(hdr))
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			rtest.OK(t, err)
+			defer func() { _ = f.Close() }()
+			_, err = io.Copy(w, f)
+			rtest.OK(t, err)
+		}
+		return nil
+	})
+	rtest.OK(t, err)
+	rtest.OK(t, w.Close())
+
+	f, err := os.Create(tarPath)
+	rtest.OK(t, err)
+	defer func() { _ = f.Close() }()
+	var out io.Writer = f
+	var closeOut io.Closer
+	switch format {
+	case "w:gz":
+		gz := gzip.NewWriter(f)
+		out = gz
+		closeOut = gz
+	case "w:xz":
+		xzw, err := xz.NewWriter(f)
+		rtest.OK(t, err)
+		out = xzw
+		closeOut = xzw
+	}
+	_, err = io.Copy(out, &buf)
+	rtest.OK(t, err)
+	if closeOut != nil {
+		rtest.OK(t, closeOut.Close())
+	}
+}
+
+// TestBackupMigrateTar backs up a tar archive in each of its plain,
+// gzipped and xz-compressed forms and verifies that the snapshot matches the
+// archive entries and that a restore reproduces the source tree (content,
+// modes and mtimes).
+func TestBackupMigrateTar(t *testing.T) {
+	for _, format := range []string{"w", "w:gz", "w:xz"} {
+		t.Run(format, func(t *testing.T) {
+			env, cleanup := withTestEnvironment(t)
+			defer cleanup()
+			testRunInit(t, env.gopts)
+
+			srcDir := filepath.Join(env.base, "src")
+			rtest.OK(t, os.MkdirAll(srcDir, 0o755))
+			createMigrateSourceTree(t, srcDir)
+
+			suffix := ".tar"
+			if format == "w:gz" {
+				suffix = ".tar.gz"
+			}
+			if format == "w:xz" {
+				suffix = ".tar.xz"
+			}
+			tarPath := filepath.Join(env.base, "archive"+suffix)
+			makeTestTar(t, srcDir, tarPath, format)
+
+			opts := BackupOptions{Migrate: []string{tarPath}}
+			testRunBackup(t, "", nil, opts, env.gopts)
+			snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+			ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+			t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+			paths := []string{"/file1.txt", "/sub", "/sub/file2.txt", "/sub/deep", "/sub/deep/file3.bin", "/empty.txt"}
+			if runtime.GOOS != "windows" {
+				paths = append(paths, "/sub/link1")
+			}
+			for _, p := range paths {
+				found := false
+				for _, line := range ls {
+					if strings.HasSuffix(line, p) {
+						found = true
+						break
+					}
+				}
+				rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+			}
+
+			restoredir := filepath.Join(env.base, "restore")
+			testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+			diff := directoriesContentsDiff(t, srcDir, restoredir)
+			rtest.Assert(t, diff == "", "restored content differs from source: %v", diff)
+
+			testRunCheck(t, env.gopts)
+		})
+	}
+}
+
+// TestBackupMigrateStandaloneGzXz backs up .gz and .xz files that do not
+// contain a tar archive: each file is stored as a single virtual file named
+// after the archive, without the compression suffix.
+func TestBackupMigrateStandaloneGzXz(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	testRunInit(t, env.gopts)
+
+	gzPath := filepath.Join(env.base, "report.gz")
+	f, err := os.Create(gzPath)
+	rtest.OK(t, err)
+	gz := gzip.NewWriter(f)
+	_, err = gz.Write([]byte("gzip report content\n"))
+	rtest.OK(t, err)
+	rtest.OK(t, gz.Close())
+	rtest.OK(t, f.Close())
+
+	xzPath := filepath.Join(env.base, "notes.xz")
+	f, err = os.Create(xzPath)
+	rtest.OK(t, err)
+	xzw, err := xz.NewWriter(f)
+	rtest.OK(t, err)
+	_, err = xzw.Write([]byte("xz notes content\n"))
+	rtest.OK(t, err)
+	rtest.OK(t, xzw.Close())
+	rtest.OK(t, f.Close())
+
+	opts := BackupOptions{Migrate: []string{gzPath, xzPath}}
+	testRunBackup(t, "", nil, opts, env.gopts)
+	snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+	ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+	t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+	for _, p := range []string{"/report", "/notes"} {
+		found := false
+		for _, line := range ls {
+			if strings.HasSuffix(line, p) {
+				found = true
+				break
+			}
+		}
+		rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+	}
+
+	restoredir := filepath.Join(env.base, "restore")
+	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+	report, err := os.ReadFile(filepath.Join(restoredir, "report"))
+	rtest.OK(t, err)
+	rtest.Equals(t, "gzip report content\n", string(report))
+	notes, err := os.ReadFile(filepath.Join(restoredir, "notes"))
+	rtest.OK(t, err)
+	rtest.Equals(t, "xz notes content\n", string(notes))
 
 	testRunCheck(t, env.gopts)
 }

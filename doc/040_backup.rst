@@ -753,71 +753,82 @@ the pipe and act accordingly (e.g., remove the last backup). Refer to the
 `Use the Unofficial Bash Strict Mode <http://redsymbol.net/articles/unofficial-bash-strict-mode/>`__
 for more details on this.
 
-Backup from zip or 7z archives
-*****************************
+Backup from zip, 7z and tar archives
+************************************
 
-Restic can back up the contents of one or more ``.zip`` or ``.7z`` archives
-directly, without extracting them to disk first. Use the ``--migrate``
-option of the ``backup`` command and pass the path(s) to the archive(s);
-the format of each archive is detected automatically, and zip and 7z
-archives can be combined in any order:
+Restic can back up the contents of one or more ``.zip``, ``.7z`` or ``.tar``
+archives directly, without extracting them to disk first. Use the
+``--migrate`` option of the ``backup`` command and pass the path(s) to the
+archive(s); the format of each archive is detected automatically, and zip, 7z
+and tar archives can be combined in any order:
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo backup --migrate /path/to/archive.zip
 
-The option can be specified multiple times to merge several archives into
-a single snapshot:
+The option can be specified multiple times to merge archives into a single
+snapshot:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo backup --migrate /path/to/a.zip --migrate /path/to/b.7z
+    $ restic -r /srv/restic-repo backup --migrate /path/to/a.zip --migrate /path/to/b.7z --migrate /path/to/c.tar.gz
 
-This creates a new snapshot whose contents correspond to the entries of
-the archives. The paths inside the archives are preserved, so
-``restic ls`` lists the same entries that ``unzip -l`` or ``7z l`` show,
-and ``restic restore`` reproduces them byte for byte, including
-permissions and modification times.
+This creates a new snapshot whose contents correspond to the entries of the
+archives. The paths inside the archives are preserved, so ``restic ls`` lists
+the same entries that ``unzip -l``, ``7z l`` or ``tar -tf`` show, and
+``restic restore`` reproduces them byte for byte, including permissions and
+modification times.
 
-When several archives are given, the entries of all archives are merged
-at the same root, in the order the archives are listed. If the same path
-occurs in more than one archive with the same type, the entry of the
-later archive is used (with a warning); if a path is a file in one
-archive and a directory in another, the first occurrence is kept and the
-conflicting entry is skipped with a warning.
+When several archives are given, the entries of all archives are merged at
+the same root, in the order the archives are listed. If the same path occurs
+in more than one archive of the same type, the entry of the later archive is
+used (with a warning); if a path is a file in one archive and a directory in
+another, the first occurrence is kept and the conflicting entry is skipped
+with a warning.
 
-Only the archives themselves are read: entry contents are decompressed on
-the fly while the backup runs, so memory usage stays bounded no matter how
-large the archives are. The archives are validated before the repository
-is opened, so a missing or unreadable archive fails the backup without
-touching the repository.
+Tar archives are recognized by their content and may be plain (``.tar``),
+gzipped (``.tar.gz`` / ``.tgz``) or xz-compressed (``.tar.xz`` / ``.txz``). A
+gzipped or xz-compressed file that does not contain a tar archive is backed
+up as a single virtual file named after the archive without the compression
+suffix (e.g. ``report.gz`` becomes ``/report``).
+
+Only the archives themselves are read: entry contents are decompressed on the
+fly while the backup runs, so memory usage stays bounded no matter how large
+the archives are. The archives are validated before the repository is opened,
+so a missing or unreadable archive fails the backup without touching the
+repository.
 
 Notes and limitations:
 
-* ``--migrate`` behaves like ``--force``: the archives are read fully,
-  so no parent snapshot is searched for or used. The option cannot be
-  combined with ``--parent``, positional file or directory arguments,
-  ``--stdin`` / ``--stdin-from-command``, or the ``--files-from*``
-  options. The same archive cannot be listed twice.
-* Permissions are preserved when the archive was created on Unix or
-  macOS; in archives created elsewhere, files are stored with mode
-  ``0644`` and directories with mode ``0755``. The zip format only
-  stores timestamps with one-second precision, so sub-second precision
-  is lost; 7z preserves the full timestamp precision.
-* Symbolic links contained in the archive are backed up as symbolic
-  links. Other special file types (FIFOs, sockets, device nodes) are
-  skipped with a warning. Note that the 7z format has no dedicated
-  symlink entry: a 7z archive only restores a symlink if the tool that
-  created it stored the ``sIFLNK`` attribute. The 7-Zip command line
-  tool on Linux dereferences symlinks when creating an archive, so
-  archives made with it contain the linked file instead.
-* 7z archives: the common compression methods are supported (LZMA,
-  LZMA2, Zstd, Deflate, Bzip2, LZ4, Brotli, PPMD, Delta and the BCJ
-  filters, plus stored data). Encrypted entries, entries using an
-  unsupported method, and entries whose names are unsafe or would
-  escape the archive root are skipped with a warning.
-* The ``--exclude``, ``--tag``, ``--time`` and ``--dry-run`` options
-  work as usual with ``--migrate``.
+* ``--migrate`` behaves like ``--force``: archives are read fully, no parent
+  snapshot is searched or used. The option cannot be combined with
+  ``--parent``, positional file or directory arguments, ``--stdin`` /
+  ``--stdin-from-command``, or ``--files-from*`` options. The same archive
+  cannot be listed twice.
+* Permissions are preserved when the archive was created on Unix or macOS;
+  in archives created elsewhere, files are stored with mode ``0644`` and
+  directories with mode ``0755``. The zip format only stores timestamps with
+  one-second precision, so sub-second precision is lost; 7z and tar preserve
+  full timestamp precision.
+* Symbolic links contained in the archives are backed up as symbolic links.
+  Other special file types (FIFOs, sockets, device nodes) are skipped with a
+  warning. Note that the 7z format has no dedicated symlink entry: a 7z
+  archive only restores a symlink if the tool that created it stored the
+  ``sIFLNK`` attribute. The 7-Zip command line tool on Linux dereferences
+  symlinks when creating an archive, so archives made with it contain the
+  linked file instead.
+* Hard links in tar archives are supported: the link is backed up as a copy
+  of the content of the file it points to.
+* 7z archives: the common compression methods are supported (LZMA, LZMA2,
+  Zstd, Deflate, Bzip2, LZ4, Brotli, PPMD, Delta and BCJ filters, plus stored
+  data). Encrypted entries, entries using an unsupported method, and entries
+  with names that are unsafe or would escape the archive root are skipped
+  with a warning.
+* Tar archives: entries whose names are unsafe (escaping the archive root,
+  NUL bytes) are skipped with a warning; absolute paths and resolvable
+  ``..`` components are re-rooted inside the virtual filesystem.
+* The ``--exclude``, ``--tag``, ``--time`` and ``--dry-run`` options work as
+  usual with ``--migrate``.
 
 Tags for backup
 ***************

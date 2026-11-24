@@ -1,0 +1,33 @@
+Enhancement: Add `--migrate` option to `backup` for zip, 7z and tar archives
+
+Until now, backing up the contents of a zip, 7z or tar archive
+required extracting it to disk first.
+
+`backup --migrate <file>` now backs up the entries of a zip, 7z or tar
+archive in place, preserving the paths inside the archive. The option
+can be specified multiple times, in which case the entries of all
+given archives are merged into a single snapshot, with zip, 7z and tar
+archives freely combinable (each archive's format is detected by its
+magic bytes and, for tar, by sniffing its content). The archives are never extracted to disk: entry
+contents are decompressed on the fly and streamed to the repository,
+so memory usage stays bounded no matter how large the archives are.
+`restore` reproduces the entries byte for byte, including
+permissions and modification times. The archives are validated
+before the repository is opened, and the backup always behaves like
+`--force`, as the archives have no meaningful parent snapshot.
+
+For 7z archives, the common compression methods are supported
+(LZMA, LZMA2, Zstd, Deflate, Bzip2, LZ4, Brotli, PPMD, Delta, the
+BCJ filters and stored data); encrypted or unsupported entries are
+skipped with a warning.
+
+Tar archives may be plain (`.tar`), gzipped (`.tar.gz`, `.tgz`) or
+xz-compressed (`.tar.xz`, `.txz`); tar entries that are unsafe (escape
+the archive root, contain NUL bytes) are skipped with a warning,
+absolute paths are re-rooted inside the virtual filesystem, and hard
+links are backed up as copies of their target's content. A gzipped or
+xz-compressed file that does not contain a tar archive is backed up as
+a single virtual file named after the archive without the compression
+suffix (e.g. `report.gz` becomes `/report`).
+
+https://github.com/Saiyine/restic

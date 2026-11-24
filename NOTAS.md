@@ -251,3 +251,60 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
 - Docs/changelog: sección de `040_backup.rst` ampliada a "Backup from zip
   or 7z archives" (nota sobre symlinks/7z y métodos soportados); changelog
   renombrado a `pull-migrate-zip-and-7z`.
+
+### A9 — tarballs y .gz/.xz sueltos (`--migrate` zip, 7z y tar)
+
+- Qué hice: `--migrate` ahora acepta también archives tar en forma
+  plana (`.tar`) o comprimida (`.tar.gz`/`.tgz`, `.tar.xz`/`.txz`), y
+  cualquier fichero `.gz`/`.xz` que NO contenga un tar como un único
+  fichero virtual (p. ej. `report.gz` → `/report`). `NewMigrate` usa
+  ahora `probeArchive`: zip/7z por magic bytes; tar plano por snif del
+  primer bloque (magic ustar en offset 257, o bloque de ceros, que es
+  un archive vacío); wrapper gz/xz descomprimiendo los primeros 512 B
+  y snifeando lo mismo. Un wrapper que no se puede descomprimir se
+  clasifica como `kindSingle` y la pasada de index reporta el error
+  real. `internal/fs/fs_tar.go` (nuevo) tiene el indexer/reader: un
+  stream descomprimido por archive (`openTarStream` plain/gzip/xz, con
+  `xzReadCloser` propio), un cursor de avance (`openAt`/`openContent`
+  con `io.LimitReader`; plain tar busca, gz/xz avanza rápido desde 0)
+  que se descarta si una lectura se abandona a medias, y
+  `indexTarEntry` que mapea dir/symlink/hardlink/regular
+  (`TypeGNUSparse` se trata como regular, el reader materializa los
+  huecos) a `archiveEntry`, con las mismas reglas de re-rooting/escapes
+  que zip y 7z (`archiveCleanEntryName`); los hard links se respaldan
+  como copia del contenido de su target.
+- Go 1.26: `tar.Reader.Next()` NO devuelve `ErrInsecurePath` por defecto
+  (solo con `GODEBUG=tarinsecurepath=0`); se gestiona en el index (el
+  header es válido; `archiveCleanEntryName` lo sanea o lo rechaza con
+  warning). Los symlinks son header-only para el reader de Go (el campo
+  `size` se ignora), así que el target solo se toma de `Linkname`;
+  target vacío → entrada omitida con warning.
+- mtime: `.gz` suelto → mtime del header gzip (bytes 4–7 little-endian;
+  0 → mtime del fichero); `.xz` suelto → mtime del fichero. Nombre
+  virtual: strip de `.tar.gz`/`.tgz`/`.tar.xz`/`.txz`/`.gz`/`.xz`.
+- go.mod: `ulikunitz/xz` v0.5.15 (ya indirecta vía `sevenzip`) pasa a
+  directa — footprint relevante para upstream.
+- Testdata: 9 fixtures deterministas en `internal/fs/testdata/tar/`
+  (`basic.tar`, `gz.tar.gz` con PAX/symlink/hardlink/nombre>100/
+  directorio 0700/chrdev, `xz.tar.xz`, `alpha.gz`, `beta.xz`,
+  `dup_a.tar`/`dup_b.tar`, `empty.tar`, `large.tar.gz`) +
+  `generate.py` reproducible (Python tarfile+gzip+lzma, mtimes y
+  timestamp del header gzip fijados; sin depender de `tar`/`gzip`/`xz`
+  al correr los tests).
+- Tests: 15 unitarios `TestTar*` nuevos en `fs` (plain/gz/xz,
+  standalone gz/xz, duplicados, vacío, grande, gz/xz corruptos → error
+  claro, archive-slip (re-rooting de absolutos y `..` resolvable,
+  escapes omitidos), concurrencia -race, lectura parcial abandonada,
+  no-acceso-a-disco, probing de formatos incluido .gz/.xz que no son
+  tar). Integración en `cmd/restic`: `TestBackupMigrateTar` (forma
+  plain/gz/xz; `ls` del snapshot y restore byte a byte comparado con el
+  árbol fuente, con symlink, modos y mtimes) y
+  `TestBackupMigrateStandaloneGzXz` (un `.gz` y un `.xz` en el mismo
+  snapshot; contenidos restaurados).
+- CLI: help del flag `--migrate` actualizado ("zip, 7z or tar ... plus
+  standalone .gz/.xz files"); variable interna `zipFS` renombrada a
+  `migrateFS`.
+- Docs/changelog: sección de `040_backup.rst` renombrada a "Backup from
+  zip, 7z and tar archives" y ampliada (tar plano/gz/xz, .gz/.xz
+  sueltos, hard links, reglas de nombres); changelog movido a
+  `pull-migrate-zip-7z-tar` y ampliado en consecuencia.
