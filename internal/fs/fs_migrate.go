@@ -27,12 +27,24 @@ const (
 	kindUnknown archiveKind = iota
 	kindZip
 	kindSevenZip
+	kindTar    // a tar archive, plain or compressed (see archiveInfo.comp)
+	kindSingle // a standalone .gz/.xz file without a tar inside
 )
 
 var (
 	zipMagic      = []byte{0x50, 0x4B, 0x03, 0x04} // "PK\x03\x04"
 	sevenzipMagic = []byte{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}
+	gzipMagic     = []byte{0x1F, 0x8B}
+	xzMagic       = []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}
+	tarMagic      = []byte("ustar") // at offset 257 of the first tar block
 )
+
+// archiveInfo is the result of probing an archive file: its kind and, for
+// tar-based archives and standalone files, the compression used.
+type archiveInfo struct {
+	kind archiveKind
+	comp tarCompression
+}
 
 // archiveEntry is a single entry (file, directory or symlink) of the virtual
 // archive filesystem, independent of the underlying archive format.
@@ -274,67 +286,135 @@ func readLinkTarget(size uint64, open func() (io.ReadCloser, error)) (string, er
 	return strings.TrimSuffix(string(target), "\x00"), nil
 }
 
-// peekArchiveKind reports the format of the archive at path by its magic
-// bytes, without reading more of the file.
-func peekArchiveKind(path string) (archiveKind, error) {
+// probeArchive reports the format of the archive at path: zip and 7z by
+// their leading magic bytes; tar (plain, gzipped or xz-compressed) by
+// sniffing the first 512 bytes of the (decompressed) content for the ustar
+// magic; and any other gzipped or xz-compressed file as a standalone
+// single-file archive.
+func probeArchive(path string) (archiveInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return kindUnknown, err
+		return archiveInfo{}, err
 	}
-	defer func() {
-		_ = f.Close()
-	}()
+	defer func() { _ = f.Close() }()
 
 	var magic [6]byte
 	if _, err := io.ReadFull(f, magic[:]); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return kindUnknown, fmt.Errorf("%s: file too short to be an archive", path)
+			return archiveInfo{}, fmt.Errorf("%s: file too short to be an archive", path)
 		}
-		return kindUnknown, err
+		return archiveInfo{}, err
 	}
 
 	switch {
 	case bytes.Equal(magic[:4], zipMagic):
-		return kindZip, nil
+		return archiveInfo{kind: kindZip}, nil
 	case bytes.Equal(magic[:], sevenzipMagic):
-		return kindSevenZip, nil
-	default:
-		return kindUnknown, fmt.Errorf("%s: unsupported archive format (only zip and 7z are supported)", path)
+		return archiveInfo{kind: kindSevenZip}, nil
+	case bytes.Equal(magic[:2], gzipMagic):
+		return probeWrappedArchive(path, tarGzip)
+	case bytes.Equal(magic[:], xzMagic):
+		return probeWrappedArchive(path, tarXz)
 	}
+
+	// an uncompressed tar has no magic at the start: the ustar magic sits
+	// at offset 257 of the first 512-byte block
+	if ok, err := sniffTar(f); err != nil {
+		return archiveInfo{}, err
+	} else if ok {
+		return archiveInfo{kind: kindTar, comp: tarPlain}, nil
+	}
+	return archiveInfo{}, fmt.Errorf("%s: unsupported archive format (only zip, 7z and tar are supported)", path)
 }
 
-// NewMigrate opens the archives at archivePaths (zip and/or 7z, in any
-// combination) and indexes their entries into a single virtual filesystem.
-// The format of each archive is detected by its magic bytes. The result is
-// equivalent to a single virtual archive whose entries are the
-// concatenation of the entries of the given archives, in the order given:
-// the usual rules apply to the concatenated entries (duplicate paths of the
-// same type keep the last entry, entries conflicting with an existing entry
-// of a different type are skipped with a warning). Nothing is extracted to
-// disk. All archives stay open until the returned MigrateFS is closed.
+// sniffTar reports whether the file (positioned anywhere) is an
+// uncompressed tar, by its first block: either a header with the ustar
+// magic, or an all-zero block (an empty archive, as tar itself treats
+// leading zero blocks as end-of-archive).
+func sniffTar(f *os.File) (bool, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	buf := make([]byte, 512)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil // shorter than one tar block: not a tar
+		}
+		return false, err
+	}
+	return isTarBlock(buf), nil
+}
+
+// isTarBlock reports whether buf is the first block of a tar archive: a
+// ustar header or an all-zero (empty archive) block.
+func isTarBlock(buf []byte) bool {
+	if bytes.Equal(buf[257:262], tarMagic) {
+		return true
+	}
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// probeWrappedArchive sniffs the decompressed content of a gzipped or
+// xz-compressed file: a tar inside, or a standalone file. A wrapper that
+// cannot be decompressed at all is classified as a standalone file so that
+// the indexing pass reports the actual error.
+func probeWrappedArchive(path string, comp tarCompression) (archiveInfo, error) {
+	rc, err := openTarStream(path, comp)
+	if err != nil {
+		return archiveInfo{kind: kindSingle, comp: comp}, nil
+	}
+	buf := make([]byte, 512)
+	_, rerr := io.ReadFull(rc, buf)
+	_ = rc.Close()
+	if rerr == nil && isTarBlock(buf) {
+		return archiveInfo{kind: kindTar, comp: comp}, nil
+	}
+	return archiveInfo{kind: kindSingle, comp: comp}, nil
+}
+
+// NewMigrate opens the archives at archivePaths (zip, 7z and tar in any
+// combination, with tar optionally compressed with gzip or xz, plus
+// standalone .gz/.xz files) and indexes their entries into a single virtual
+// filesystem. The format of each archive is detected by its magic bytes and,
+// for tar, by sniffing its content. The result is equivalent to a single
+// virtual archive whose entries are the concatenation of the entries of the
+// given archives, in the order given: the usual rules apply to the
+// concatenated entries (duplicate paths of the same type keep the last
+// entry, entries conflicting with an existing entry of a different type are
+// skipped with a warning). Nothing is extracted to disk. All archives stay
+// open until the returned MigrateFS is closed.
 func NewMigrate(archivePaths []string, warnf func(format string, args ...any)) (*MigrateFS, error) {
 	if len(archivePaths) == 0 {
 		return nil, errors.New("no archives given")
 	}
 
 	// Fail fast: probe every archive before opening any of them.
-	kinds := make([]archiveKind, len(archivePaths))
+	infos := make([]archiveInfo, len(archivePaths))
 	for i, p := range archivePaths {
-		k, err := peekArchiveKind(p)
+		info, err := probeArchive(p)
 		if err != nil {
 			return nil, err
 		}
-		kinds[i] = k
+		infos[i] = info
 	}
 
 	m := newMigrateFS(warnf, 0)
 	for i, p := range archivePaths {
 		var err error
-		switch kinds[i] {
+		switch infos[i].kind {
 		case kindZip:
 			err = m.openZipArchive(p)
 		case kindSevenZip:
 			err = m.openSevenZipArchive(p)
+		case kindTar:
+			err = m.openTarArchive(p, infos[i].comp)
+		case kindSingle:
+			err = m.openSingleFile(p, infos[i].comp)
 		}
 		if err != nil {
 			_ = m.Close()
