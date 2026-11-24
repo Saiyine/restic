@@ -114,7 +114,7 @@ func TestBackupMigrate(t *testing.T) {
 	zipPath := filepath.Join(env.base, "archive.zip")
 	makeTestZip(t, srcDir, zipPath)
 
-	opts := BackupOptions{Migrate: zipPath}
+	opts := BackupOptions{Migrate: []string{zipPath}}
 	testRunBackup(t, "", nil, opts, env.gopts)
 	snapshotIDs := testListSnapshots(t, env.gopts, 1)
 
@@ -164,6 +164,85 @@ func TestBackupMigrate(t *testing.T) {
 	testRunCheck(t, env.gopts)
 }
 
+// TestBackupMigrateMultipleArchives backs up two archives at once with a
+// repeated --migrate option: the snapshot contains the union of both
+// archives, and an entry present in both keeps the version of the later
+// archive.
+func TestBackupMigrateMultipleArchives(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	testRunInit(t, env.gopts)
+
+	// the zip format only stores timestamps in seconds, so all fixture
+	// trees use a fixed whole-second mtime
+	fixed := time.Date(2023, 5, 4, 3, 2, 1, 0, time.UTC)
+	fixMtimes := func(dir string) {
+		t.Helper()
+		err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(p, fixed, fixed)
+		})
+		rtest.OK(t, err)
+	}
+
+	// archive A: a.txt, shared/fromA.txt, shared/onlyA.txt
+	dirA := filepath.Join(env.base, "srcA")
+	rtest.OK(t, os.MkdirAll(filepath.Join(dirA, "shared"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirA, "a.txt"), []byte("from A\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirA, "shared", "fromA.txt"), []byte("A version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirA, "shared", "onlyA.txt"), []byte("only in A\n"), 0o644))
+	fixMtimes(dirA)
+	zipA := filepath.Join(env.base, "a.zip")
+	makeTestZip(t, dirA, zipA)
+
+	// archive B: b.txt, shared/fromA.txt (overrides A), shared/deep/onlyB.txt
+	dirB := filepath.Join(env.base, "srcB")
+	rtest.OK(t, os.MkdirAll(filepath.Join(dirB, "shared", "deep"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirB, "b.txt"), []byte("from B\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirB, "shared", "fromA.txt"), []byte("B version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirB, "shared", "deep", "onlyB.txt"), []byte("only in B\n"), 0o644))
+	fixMtimes(dirB)
+	zipB := filepath.Join(env.base, "b.zip")
+	makeTestZip(t, dirB, zipB)
+
+	opts := BackupOptions{Migrate: []string{zipA, zipB}}
+	testRunBackup(t, "", nil, opts, env.gopts)
+	snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+	ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+	t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+	for _, p := range []string{"/a.txt", "/b.txt", "/shared", "/shared/fromA.txt", "/shared/onlyA.txt", "/shared/deep", "/shared/deep/onlyB.txt"} {
+		found := false
+		for _, line := range ls {
+			if strings.HasSuffix(line, p) {
+				found = true
+				break
+			}
+		}
+		rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+	}
+
+	// restore and compare against the expected merged tree, where the entry
+	// present in both archives has the version of the second one
+	expected := filepath.Join(env.base, "expected")
+	rtest.OK(t, os.MkdirAll(filepath.Join(expected, "shared", "deep"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "a.txt"), []byte("from A\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "b.txt"), []byte("from B\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "fromA.txt"), []byte("B version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "onlyA.txt"), []byte("only in A\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "deep", "onlyB.txt"), []byte("only in B\n"), 0o644))
+	fixMtimes(expected)
+
+	restoredir := filepath.Join(env.base, "restored")
+	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+	diff := directoriesContentsDiff(t, expected, restoredir)
+	rtest.Assert(t, diff == "", "restored content differs from the merged archives: %v", diff)
+
+	testRunCheck(t, env.gopts)
+}
+
 func TestBackupMigrateIncompatibleOptions(t *testing.T) {
 	env, cleanup := withTestEnvironment(t)
 	defer cleanup()
@@ -175,11 +254,11 @@ func TestBackupMigrateIncompatibleOptions(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"positional args", BackupOptions{Migrate: "archive.zip"}, []string{"somefile"}, "cannot be combined with file or directory arguments"},
-		{"stdin", BackupOptions{Migrate: "archive.zip", Stdin: true}, nil, "cannot be combined with --stdin"},
-		{"stdin from command", BackupOptions{Migrate: "archive.zip", StdinCommand: true}, nil, "cannot be combined with --stdin"},
-		{"files-from", BackupOptions{Migrate: "archive.zip", FilesFrom: []string{"files.txt"}}, nil, "cannot be combined with --files-from"},
-		{"parent", BackupOptions{Migrate: "archive.zip", Parent: "latest"}, nil, "cannot be combined with --parent"},
+		{"positional args", BackupOptions{Migrate: []string{"archive.zip"}}, []string{"somefile"}, "cannot be combined with file or directory arguments"},
+		{"stdin", BackupOptions{Migrate: []string{"archive.zip"}, Stdin: true}, nil, "cannot be combined with --stdin"},
+		{"stdin from command", BackupOptions{Migrate: []string{"archive.zip"}, StdinCommand: true}, nil, "cannot be combined with --stdin"},
+		{"files-from", BackupOptions{Migrate: []string{"archive.zip"}, FilesFrom: []string{"files.txt"}}, nil, "cannot be combined with --files-from"},
+		{"parent", BackupOptions{Migrate: []string{"archive.zip"}, Parent: "latest"}, nil, "cannot be combined with --parent"},
 	}
 
 	for _, tc := range cases {
@@ -199,7 +278,7 @@ func TestBackupMigrateInvalidZip(t *testing.T) {
 	// repository is opened, so the error must come from the zip file, not
 	// from the repository
 	err := testRunBackupAssumeFailure(t, "", nil,
-		BackupOptions{Migrate: filepath.Join(env.base, "missing.zip")}, env.gopts)
+		BackupOptions{Migrate: []string{filepath.Join(env.base, "missing.zip")}}, env.gopts)
 	rtest.Assert(t, err != nil, "expected error for missing zip file")
 	rtest.Assert(t, !strings.Contains(err.Error(), "repository"),
 		"zip must be validated before the repository is opened, got: %v", err)
@@ -213,7 +292,7 @@ func TestBackupMigrateInvalidZip(t *testing.T) {
 	makeTestZip(t, srcDir, zipPath)
 
 	err = testRunBackupAssumeFailure(t, "", nil,
-		BackupOptions{Migrate: zipPath}, env.gopts)
+		BackupOptions{Migrate: []string{zipPath}}, env.gopts)
 	rtest.Assert(t, err != nil, "expected error for missing repository")
 	t.Logf("error as expected: %v", err)
 }
@@ -229,7 +308,7 @@ func TestBackupMigrateExclude(t *testing.T) {
 	zipPath := filepath.Join(env.base, "archive.zip")
 	makeTestZip(t, srcDir, zipPath)
 
-	opts := BackupOptions{Migrate: zipPath}
+	opts := BackupOptions{Migrate: []string{zipPath}}
 	opts.Excludes = []string{"*.bin"}
 	testRunBackup(t, "", nil, opts, env.gopts)
 	snapshotIDs := testListSnapshots(t, env.gopts, 1)
@@ -262,7 +341,7 @@ func TestBackupMigrateDryRun(t *testing.T) {
 	zipPath := filepath.Join(env.base, "archive.zip")
 	makeTestZip(t, srcDir, zipPath)
 
-	opts := BackupOptions{Migrate: zipPath, DryRun: true}
+	opts := BackupOptions{Migrate: []string{zipPath}, DryRun: true}
 	testRunBackup(t, "", nil, opts, env.gopts)
 
 	// no snapshot must be created
@@ -322,7 +401,7 @@ func TestBackupMigrateMemoryUsage(t *testing.T) {
 	}
 	rtest.OK(t, zw.Close())
 
-	opts := BackupOptions{Migrate: zipPath}
+	opts := BackupOptions{Migrate: []string{zipPath}}
 	testRunBackup(t, "", nil, opts, env.gopts)
 	testListSnapshots(t, env.gopts, 1)
 

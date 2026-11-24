@@ -82,7 +82,7 @@ type BackupOptions struct {
 	Stdin             bool
 	StdinFilename     string
 	StdinCommand      bool
-	Migrate           string
+	Migrate           []string
 	Tags              data.TagLists
 	Host              string
 	FilesFrom         []string
@@ -116,7 +116,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
-	f.StringVar(&opts.Migrate, "migrate", "", "back up the contents of the given `zip` archive in place, without extracting it to disk")
+	f.StringArrayVar(&opts.Migrate, "migrate", nil, "back up the contents of the given `zip` archive(s) in place, without extracting them to disk (can be specified multiple times)")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
 	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
@@ -328,7 +328,20 @@ func (opts BackupOptions) Check(gopts global.Options, args []string) error {
 		}
 	}
 
-	if opts.Migrate != "" {
+	if len(opts.Migrate) > 0 {
+		for _, archive := range opts.Migrate {
+			if strings.TrimSpace(archive) == "" {
+				return errors.Fatal("--migrate: empty archive path")
+			}
+		}
+		if seen := make(map[string]struct{}, len(opts.Migrate)); len(opts.Migrate) > 1 {
+			for _, archive := range opts.Migrate {
+				if _, ok := seen[archive]; ok {
+					return errors.Fatalf("--migrate: duplicate archive %q", archive)
+				}
+				seen[archive] = struct{}{}
+			}
+		}
 		if len(args) > 0 {
 			return errors.Fatal("--migrate cannot be combined with file or directory arguments")
 		}
@@ -339,7 +352,7 @@ func (opts BackupOptions) Check(gopts global.Options, args []string) error {
 			return errors.Fatal("--migrate cannot be combined with --files-from, --files-from-verbatim or --files-from-raw")
 		}
 		if opts.Parent != "" {
-			return errors.Fatal("--migrate cannot be combined with --parent (the zip is always read fully)")
+			return errors.Fatal("--migrate cannot be combined with --parent (the archives are always read fully)")
 		}
 	}
 
@@ -374,7 +387,7 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository, w
 // from being saved in a snapshot based on path and file info
 func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf func(msg string, args ...any)) (funcs []archiver.RejectFunc, err error) {
 	// allowed devices (not applicable to the virtual zip filesystem)
-	if opts.ExcludeOtherFS && !opts.Stdin && !opts.StdinCommand && opts.Migrate == "" {
+	if opts.ExcludeOtherFS && !opts.Stdin && !opts.StdinCommand && len(opts.Migrate) == 0 {
 		f, err := archiver.RejectByDevice(targets, fs)
 		if err != nil {
 			return nil, err
@@ -421,7 +434,7 @@ func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf fu
 
 // collectTargets returns a list of target files/dirs from several sources.
 func collectTargets(opts BackupOptions, args []string, warnf func(msg string, args ...any), stdin io.ReadCloser) (targets []string, err error) {
-	if opts.Migrate != "" {
+	if len(opts.Migrate) > 0 {
 		// the whole zip archive is the target; its root is the virtual "/"
 		return []string{"/"}, nil
 	}
@@ -540,12 +553,12 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 	// validate the zip archive before opening the repository, so that a
 	// missing or unreadable archive fails fast without touching the repo
 	var zipFS *fs.Zip
-	if opts.Migrate != "" {
+	if len(opts.Migrate) > 0 {
 		// a zip archive has no meaningful parent snapshot: always read
 		// everything (behaves like --force)
 		opts.Force = true
 
-		zipFS, err = fs.NewZip(opts.Migrate, printer.E)
+		zipFS, err = fs.NewZipMulti(opts.Migrate, printer.E)
 		if err != nil {
 			return err
 		}
@@ -638,7 +651,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		targetFS = localVss
 	}
 
-	if opts.Migrate != "" {
+	if len(opts.Migrate) > 0 {
 		targetFS = zipFS
 	}
 
