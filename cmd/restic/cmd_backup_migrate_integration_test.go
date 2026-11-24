@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,6 +15,39 @@ import (
 
 	rtest "github.com/restic/restic/internal/test"
 )
+
+// makeTestSevenZip creates a 7z archive at outPath containing the content of
+// srcDir with relative entry names (as `7z a out.7z .` from within srcDir).
+// The 7z command line tool is required; the calling test is skipped when it
+// is not installed.
+func makeTestSevenZip(t testing.TB, srcDir, outPath string) {
+	t.Helper()
+	bin, err := exec.LookPath("7z")
+	if err != nil {
+		t.Skip("7z command not found, skipping sevenzip test")
+	}
+	cmd := exec.Command(bin, "a", "-y", "-bso0", "-bd", outPath, ".")
+	cmd.Dir = srcDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("7z failed: %v\n%s", err, out)
+	}
+}
+
+// fixTreeMtimes sets the modification and access time of every file and
+// directory in dir to a fixed whole-second instant: both zip and 7z store
+// timestamps in seconds (7z keeps the nanoseconds, which are zero here), so
+// a restored tree can be compared against the source tree.
+func fixTreeMtimes(t testing.TB, dir string) {
+	t.Helper()
+	fixed := time.Date(2023, 5, 4, 3, 2, 1, 0, time.UTC)
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(p, fixed, fixed)
+	})
+	rtest.OK(t, err)
+}
 
 // makeTestZip creates a zip archive at zipPath containing the content of
 // srcDir, preserving file modes and modification times. It is used to build
@@ -420,6 +454,127 @@ func TestBackupMigrateMemoryUsage(t *testing.T) {
 	if peakMiB > maxPeakMiB {
 		t.Errorf("peak RSS %d MiB exceeds %d MiB, backup does not stream the zip", peakMiB, maxPeakMiB)
 	}
+
+	testRunCheck(t, env.gopts)
+}
+
+// TestBackupMigrateSevenZip backs up a 7z archive and verifies that the
+// snapshot matches the archive entries and that a restore reproduces the
+// source tree (content, modes and mtimes). Note: 7z on Linux dereferences
+// symlinks when creating an archive, so the fixture tree has none; symlink
+// semantics are covered by the unit tests of the fs package.
+func TestBackupMigrateSevenZip(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	testRunInit(t, env.gopts)
+
+	srcDir := filepath.Join(env.base, "src")
+	rtest.OK(t, os.MkdirAll(filepath.Join(srcDir, "sub", "deep"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(srcDir, "file1.txt"), []byte("content one\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(srcDir, "sub", "file2.txt"), []byte("content two\n"), 0o640))
+	rtest.OK(t, os.WriteFile(filepath.Join(srcDir, "sub", "deep", "file3.bin"), make([]byte, 4096), 0o640))
+	rtest.OK(t, os.WriteFile(filepath.Join(srcDir, "empty.txt"), nil, 0o644))
+	fixTreeMtimes(t, srcDir)
+
+	sevenZipPath := filepath.Join(env.base, "archive.7z")
+	makeTestSevenZip(t, srcDir, sevenZipPath)
+
+	opts := BackupOptions{Migrate: []string{sevenZipPath}}
+	testRunBackup(t, "", nil, opts, env.gopts)
+	snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+	// restic ls must show the entries of the 7z archive
+	ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+	t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+	for _, p := range []string{"/file1.txt", "/sub", "/sub/file2.txt", "/sub/deep", "/sub/deep/file3.bin", "/empty.txt"} {
+		found := false
+		for _, line := range ls {
+			if strings.HasSuffix(line, p) {
+				found = true
+				break
+			}
+		}
+		rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+	}
+
+	// restore and compare with the source tree
+	restoredir := filepath.Join(env.base, "restore")
+	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+	diff := directoriesContentsDiff(t, srcDir, restoredir)
+	rtest.Assert(t, diff == "", "restored content differs from source: %v", diff)
+	for p, want := range map[string]string{
+		"file1.txt":                       "content one\n",
+		filepath.Join("sub", "file2.txt"): "content two\n",
+	} {
+		got, err := os.ReadFile(filepath.Join(restoredir, p))
+		rtest.OK(t, err)
+		rtest.Equals(t, want, string(got), "content of %s", p)
+	}
+
+	testRunCheck(t, env.gopts)
+}
+
+// TestBackupMigrateMixedZipSevenZip backs up a zip archive and a 7z archive
+// together in one run: the snapshot contains the union of both archives, and
+// an entry present in both keeps the version of the later archive.
+func TestBackupMigrateMixedZipSevenZip(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	testRunInit(t, env.gopts)
+
+	// zip archive: a.txt, shared/fromZip.txt, shared/onlyZip.txt
+	dirZip := filepath.Join(env.base, "srcZip")
+	rtest.OK(t, os.MkdirAll(filepath.Join(dirZip, "shared"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirZip, "a.txt"), []byte("from zip\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirZip, "shared", "fromZip.txt"), []byte("zip version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dirZip, "shared", "onlyZip.txt"), []byte("only in zip\n"), 0o644))
+	fixTreeMtimes(t, dirZip)
+	zipPath := filepath.Join(env.base, "a.zip")
+	makeTestZip(t, dirZip, zipPath)
+
+	// 7z archive: b.txt, shared/fromZip.txt (overrides the zip entry),
+	// shared/only7z.txt
+	dir7z := filepath.Join(env.base, "src7z")
+	rtest.OK(t, os.MkdirAll(filepath.Join(dir7z, "shared"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(dir7z, "b.txt"), []byte("from 7z\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dir7z, "shared", "fromZip.txt"), []byte("7z version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(dir7z, "shared", "only7z.txt"), []byte("only in 7z\n"), 0o644))
+	fixTreeMtimes(t, dir7z)
+	sevenZipPath := filepath.Join(env.base, "b.7z")
+	makeTestSevenZip(t, dir7z, sevenZipPath)
+
+	opts := BackupOptions{Migrate: []string{zipPath, sevenZipPath}}
+	testRunBackup(t, "", nil, opts, env.gopts)
+	snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+	ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+	t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+	for _, p := range []string{"/a.txt", "/b.txt", "/shared", "/shared/fromZip.txt", "/shared/onlyZip.txt", "/shared/only7z.txt"} {
+		found := false
+		for _, line := range ls {
+			if strings.HasSuffix(line, p) {
+				found = true
+				break
+			}
+		}
+		rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+	}
+
+	// restore and compare against the expected merged tree: the duplicated
+	// entry keeps the version of the last archive (the 7z one)
+	expected := filepath.Join(env.base, "expected")
+	rtest.OK(t, os.MkdirAll(filepath.Join(expected, "shared"), 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "a.txt"), []byte("from zip\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "b.txt"), []byte("from 7z\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "fromZip.txt"), []byte("7z version\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "onlyZip.txt"), []byte("only in zip\n"), 0o644))
+	rtest.OK(t, os.WriteFile(filepath.Join(expected, "shared", "only7z.txt"), []byte("only in 7z\n"), 0o644))
+	fixTreeMtimes(t, expected)
+
+	restoredir := filepath.Join(env.base, "restored")
+	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+	diff := directoriesContentsDiff(t, expected, restoredir)
+	rtest.Assert(t, diff == "", "restored content differs from the merged archives: %v", diff)
 
 	testRunCheck(t, env.gopts)
 }

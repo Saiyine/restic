@@ -195,3 +195,59 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
   e integración `TestBackupMigrateMultipleArchives` (unión + último-gana,
   restore comparado con el árbol esperado fusionado).
 - Docs/changelog actualizados; pendientes: QA completo y PR.
+
+### A8 — soporte 7z (`--migrate` zip y 7z)
+
+- Qué hice: `--migrate` ahora acepta zips y 7z en cualquier combinación.
+  Refactor del core: el tipo `Zip` se eliminó y vive ahora en
+  `MigrateFS` (`internal/fs/fs_migrate.go`) con entradas neutrales por
+  formato (`archiveEntry`); `fs_zip.go` solo conserva lo específico de zip
+  (CP437→UTF-8, creators de modo, limpieza de nombres) y `fs_sevenzip.go`
+  el indexer de 7z. `NewZip`/`NewZipMulti`/`NewSevenZip`/`NewSevenZipMulti`
+  devuelven `*MigrateFS`; `NewMigrate(paths, warnf)` detecta el formato por
+  magic bytes (`PK\x03\x04` / `37 7A BC AF 27 1C`), falla rápido probando
+  todos los paths antes de abrir ninguno, y forma un solo snapshot con la
+  misma semántica de merge que A7 (duplicado → gana el último; colisión
+  fichero/directorio → gana el primero; warnings con etiqueta `zip:`/`7z:`).
+- 7z: librería `github.com/bodgit/sevenzip` v1.6.5 (pure Go, BSD-3, decode
+  por streaming con pool LRU de folders; codecs Copy/Delta/LZMA/LZMA2/Zstd/
+  Deflate/Bzip2/LZ4/Brotli/PPMD y filtros BCJ; headers comprimidos,
+  volúmenes split y SFX). El método de compresión no es público en la lib,
+  así que la validación se hace por stream al indexar: se hace un peek
+  (Open+1 byte+Close) de la primera entrada de cada carpeta y, si el stream
+  falla (método no soportado, cifrado, datos corruptos), se omiten todas
+  sus entradas con warning. Cifrado → warning "entry is encrypted".
+- Symlinks 7z: si el atributo POSIX del entry es `sIFLNK`, el target se lee
+  del contenido (≤4096 B). Ojo: el binario 7z local (7-Zip 26.06)
+  dereferencia symlinks al crear el archivo, así que el fixture
+  `symlink.7z` se genera parcheando el binario (attrs `0x81A08020`→
+  `0xA1FF8020` y recompute de los dos CRC de headers; layout: start header
+  de 32 bytes, NextHeaderOffset relativo al final del start header,
+  NextHeaderCRC en offset 28 sobre el header, y el CRC del start header
+  cubre 12–32 así que se actualiza al final).
+- Testdata 7z: fixtures binarios commiteados en
+  `internal/fs/testdata/sevenzip/` + `generate.py` reproducible (no depende
+  de `7z` al correr los tests). El 7z local no soporta `-m0=ZSTD`, así que
+  `zstd.7z` se genera con `py7zr` (fallback automático); `empty.7z` también
+  usa `py7zr` (no hay switch CLI). `solid.7z` (LZMA2 + `-mhc=off`) es el
+  fixture de corrupción: al voltear un byte del payload, la detección
+  ocurre en el index (validación por stream) y las 3 entradas se omiten
+  con warning.
+- CLI: `cmd_backup.go` usa `fs.NewMigrate` (antes `NewZipMulti`); help del
+  flag: "zip or 7z".
+- Tests: 13 unitarios nuevos en `fs` (`TestSevenZip*`: jerarquía, codecs
+  Zstd/LZMA/Copy, modos, symlink, unicode, vacío, duplicados, colisiones
+  ambas direcciones, cifrado→skip, corrupto→skip con warnings,
+  concurrencia -race, no-acceso-a-disco, consistencia Lstat) y 4 en
+  `TestMigrate*` (mezcla zip+7z disjunta, duplicado cross-format, colisión
+  cross-format, formatos no soportados/fichero corto/faltante/vacío).
+  Integración: `TestBackupMigrateSevenZip` y
+  `TestBackupMigrateMixedZipSevenZip` (skip si no hay `7z` en PATH;
+  fixtures con mtimes enteros vía `Chtimes`).
+- go.mod: `sevenzip` pasa a dependencia directa; nuevas indirectas
+  (`bodgit/plumbing`, `bodgit/windows`, `andybalholm/brotli`,
+  `stangelandcl/ppmd`, `spf13/afero`, `go4.org`) — footprint relevante para
+  upstream.
+- Docs/changelog: sección de `040_backup.rst` ampliada a "Backup from zip
+  or 7z archives" (nota sobre symlinks/7z y métodos soportados); changelog
+  renombrado a `pull-migrate-zip-and-7z`.
