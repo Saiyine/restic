@@ -510,6 +510,140 @@ func TestZipLstatConsistency(t *testing.T) {
 	test.Assert(t, count >= 4, "expected at least 4 entries, walked %d", count)
 }
 
+func openTestZipMulti(t testing.TB, zipPaths []string, warnings *[]string) *Zip {
+	t.Helper()
+	z, err := NewZipMulti(zipPaths, func(format string, args ...any) {
+		*warnings = append(*warnings, fmt.Sprintf(format, args...))
+	})
+	test.OK(t, err)
+	t.Cleanup(func() { test.OK(t, z.Close()) })
+	return z
+}
+
+// TestZipMultiDisjoint verifies that NewZipMulti merges the entries of
+// multiple archives into a single virtual filesystem: the union of the
+// entries is visible and every file is read from its own archive.
+func TestZipMultiDisjoint(t *testing.T) {
+	dir := t.TempDir()
+	zipA := filepath.Join(dir, "a.zip")
+	zipB := filepath.Join(dir, "b.zip")
+	writeTestZip(t, zipA, []zipTestFile{
+		{name: "a.txt", content: []byte("from A")},
+		{name: "shared/dir/onlyA.txt", content: []byte("a only"), modTime: modTimeA},
+	})
+	writeTestZip(t, zipB, []zipTestFile{
+		{name: "b.txt", content: []byte("from B")},
+		{name: "shared/dir/onlyB.txt", content: []byte("b only"), modTime: modTimeB},
+	})
+
+	var warnings []string
+	z := openTestZipMulti(t, []string{zipA, zipB}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	for _, p := range []string{"/a.txt", "/b.txt", "/shared", "/shared/dir", "/shared/dir/onlyA.txt", "/shared/dir/onlyB.txt"} {
+		_, err := z.Lstat(p)
+		test.OK(t, err)
+	}
+
+	test.Equals(t, "from A", readWholeFile(t, z, "/a.txt"))
+	test.Equals(t, "from B", readWholeFile(t, z, "/b.txt"))
+	test.Equals(t, "a only", readWholeFile(t, z, "/shared/dir/onlyA.txt"))
+	test.Equals(t, "b only", readWholeFile(t, z, "/shared/dir/onlyB.txt"))
+
+	// "shared/dir" is not present in either archive: its mtime is the
+	// most recent of its descendants
+	fi, err := z.Lstat("/shared/dir")
+	test.OK(t, err)
+	test.Equals(t, modTimeB, fi.ModTime)
+}
+
+// TestZipMultiDuplicateLastWins verifies that a path present in several
+// archives keeps the entry of the last one, like a duplicate within a
+// single archive.
+func TestZipMultiDuplicateLastWins(t *testing.T) {
+	dir := t.TempDir()
+	zipA := filepath.Join(dir, "a.zip")
+	zipB := filepath.Join(dir, "b.zip")
+	writeTestZip(t, zipA, []zipTestFile{
+		{name: "same.txt", content: []byte("first"), modTime: modTimeA},
+	})
+	writeTestZip(t, zipB, []zipTestFile{
+		{name: "same.txt", content: []byte("second"), modTime: modTimeB},
+	})
+
+	var warnings []string
+	z := openTestZipMulti(t, []string{zipA, zipB}, &warnings)
+	test.Equals(t, 1, len(warnings))
+
+	test.Equals(t, "second", readWholeFile(t, z, "/same.txt"))
+	fi, err := z.Lstat("/same.txt")
+	test.OK(t, err)
+	test.Equals(t, int64(6), fi.Size)
+	test.Equals(t, modTimeB, fi.ModTime)
+}
+
+// TestZipMultiTypeConflict verifies that a path conflict between archives
+// of a file and a directory keeps the first entry, like within a single
+// archive: the conflicting one and everything below it is skipped.
+func TestZipMultiTypeConflict(t *testing.T) {
+	dir := t.TempDir()
+
+	// later file against earlier directory: the directory is kept
+	zipA := filepath.Join(dir, "a.zip")
+	zipB := filepath.Join(dir, "b.zip")
+	writeTestZip(t, zipA, []zipTestFile{
+		{name: "d/", mode: 0o755, modTime: modTimeA},
+		{name: "d/inside.txt", content: []byte("inside"), modTime: modTimeA},
+	})
+	writeTestZip(t, zipB, []zipTestFile{
+		{name: "d", content: []byte("a file"), modTime: modTimeB},
+	})
+	var warnings []string
+	z := openTestZipMulti(t, []string{zipA, zipB}, &warnings)
+	test.Equals(t, 1, len(warnings))
+	fi, err := z.Lstat("/d")
+	test.OK(t, err)
+	test.Equals(t, true, fi.Mode.IsDir())
+	test.Equals(t, "inside", readWholeFile(t, z, "/d/inside.txt"))
+
+	// later directory against earlier file: the file is kept, the
+	// directory and its entries are skipped
+	zipC := filepath.Join(dir, "c.zip")
+	zipD := filepath.Join(dir, "d.zip")
+	writeTestZip(t, zipC, []zipTestFile{
+		{name: "f", content: []byte("a file"), modTime: modTimeA},
+	})
+	writeTestZip(t, zipD, []zipTestFile{
+		{name: "f/", mode: 0o755, modTime: modTimeB},
+		{name: "f/inside.txt", content: []byte("inside"), modTime: modTimeB},
+	})
+	warnings = nil
+	z = openTestZipMulti(t, []string{zipC, zipD}, &warnings)
+	test.Equals(t, 2, len(warnings))
+	fi, err = z.Lstat("/f")
+	test.OK(t, err)
+	test.Equals(t, false, fi.Mode.IsDir())
+	test.Equals(t, "a file", readWholeFile(t, z, "/f"))
+	_, err = z.Lstat("/f/inside.txt")
+	test.Assert(t, errors.Is(err, os.ErrNotExist), "entry under the skipped directory must not exist, got %v", err)
+}
+
+// TestZipMultiOpenError verifies that a missing or invalid archive fails
+// the whole call, even when the other archives are fine.
+func TestZipMultiOpenError(t *testing.T) {
+	dir := t.TempDir()
+	zipA := filepath.Join(dir, "a.zip")
+	writeTestZip(t, zipA, []zipTestFile{
+		{name: "a.txt", content: []byte("from A")},
+	})
+
+	_, err := NewZipMulti(nil, func(string, ...any) {})
+	test.Assert(t, err != nil, "expected an error for an empty list of archives")
+
+	_, err = NewZipMulti([]string{zipA, filepath.Join(dir, "missing.zip")}, func(string, ...any) {})
+	test.Assert(t, err != nil, "expected an error for a missing archive")
+}
+
 // patchZipHeaderFlags flips a bit of the general-purpose bit flag field of
 // the named entry in both the local file header and the central directory
 // record of the archive.

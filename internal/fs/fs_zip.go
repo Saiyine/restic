@@ -2,6 +2,7 @@ package fs
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -77,14 +78,14 @@ type zipEntry struct {
 	fi         *ExtendedFileInfo
 }
 
-// Zip is a read-only filesystem view over the entries of a .zip archive. It
-// implements FS so that the archiver can back up the archive's contents in
-// place: entry content is decompressed on the fly and nothing is ever
-// extracted to disk. Concurrent OpenFile calls are safe: every opened file
-// gets its own decompressor over the (concurrency-safe) io.ReaderAt of the
-// underlying archive file, and no state is shared between Files.
+// Zip is a read-only filesystem view over the entries of one or more .zip
+// archives. It implements FS so that the archiver can back up the archives'
+// contents in place: entry content is decompressed on the fly and nothing is
+// ever extracted to disk. Concurrent OpenFile calls are safe: every opened
+// file gets its own decompressor over the (concurrency-safe) io.ReaderAt of
+// the underlying archive file, and no state is shared between Files.
 type Zip struct {
-	rc *zip.ReadCloser
+	rzs []*zip.ReadCloser
 
 	entries  map[string]*zipEntry
 	children map[string][]string // dir path -> sorted child names
@@ -99,72 +100,50 @@ type Zip struct {
 // (escaping the virtual root, NUL bytes, ...), or that are encrypted or use
 // an unsupported compression method, are skipped with a warning via warnf.
 func NewZip(zipPath string, warnf func(format string, args ...any)) (*Zip, error) {
-	zr, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return nil, err
+	return NewZipMulti([]string{zipPath}, warnf)
+}
+
+// NewZipMulti opens the zip archives at zipPaths and indexes their central
+// directories into a single virtual filesystem. The result is equivalent to
+// a single virtual archive whose entries are the concatenation of the
+// entries of the given archives, in the order given: the usual rules apply
+// to the concatenated entries (duplicate paths of the same type keep the
+// last entry, entries conflicting with an existing entry of a different
+// type are skipped with a warning). Like NewZip, nothing is extracted to
+// disk. All archives stay open until the returned Zip is closed.
+func NewZipMulti(zipPaths []string, warnf func(format string, args ...any)) (*Zip, error) {
+	if len(zipPaths) == 0 {
+		return nil, errors.New("no zip archives given")
 	}
 
 	if warnf == nil {
 		warnf = func(string, ...any) {}
 	}
 
+	rzs := make([]*zip.ReadCloser, len(zipPaths))
+	capEntries := 0
+	for i, p := range zipPaths {
+		zr, err := zip.OpenReader(p)
+		if err != nil {
+			for _, r := range rzs[:i] {
+				_ = r.Close()
+			}
+			return nil, err
+		}
+		rzs[i] = zr
+		capEntries += len(zr.File)
+	}
+
 	z := &Zip{
-		rc:       zr,
-		entries:  make(map[string]*zipEntry, len(zr.File)),
+		rzs:      rzs,
+		entries:  make(map[string]*zipEntry, capEntries),
 		children: make(map[string][]string),
 		warn:     warnf,
 	}
 
-	for _, fh := range zr.File {
-		name, ok := zipCleanEntryName(fh.Name, fh.NonUTF8)
-		if !ok {
-			warnf("zip: entry %q ignored, unsafe or invalid path", fh.Name)
-			continue
-		}
-
-		if fh.Flags&zipEncryptedFlag != 0 {
-			warnf("zip: entry %q ignored, entry is encrypted", fh.Name)
-			continue
-		}
-		if fh.Method != zip.Store && fh.Method != zip.Deflate {
-			warnf("zip: entry %q ignored, unsupported compression method %d", fh.Name, fh.Method)
-			continue
-		}
-
-		mode := fh.Mode()
-		isDir := mode.IsDir()
-		isSymlink := mode&os.ModeSymlink != 0
-
-		mtime := fh.Modified.UTC()
-		e := &zipEntry{
-			path:   name,
-			isDir:  isDir,
-			header: fh,
-			fi: &ExtendedFileInfo{
-				Name:       path.Base(name),
-				ModTime:    mtime,
-				AccessTime: mtime,
-				ChangeTime: mtime,
-			},
-		}
-		if isSymlink {
-			target, err := readSymlinkTarget(fh)
-			if err != nil {
-				warnf("zip: entry %q ignored: %v", fh.Name, err)
-				continue
-			}
-			e.linkTarget = target
-			e.fi.Mode = os.ModeSymlink | 0o777
-			e.fi.Size = int64(len(target))
-		} else {
-			e.fi.Mode = zipEntryMode(fh, isDir)
-			if !isDir {
-				e.fi.Size = int64(fh.UncompressedSize64)
-			}
-		}
-
-		if !z.addEntry(e) {
-			continue
+	for _, zr := range rzs {
+		for _, fh := range zr.File {
+			z.indexEntry(fh)
 		}
 	}
 
@@ -235,13 +214,17 @@ func NewZip(zipPath string, warnf func(format string, args ...any)) (*Zip, error
 	return z, nil
 }
 
-// Close closes the underlying zip archive.
+// Close closes the underlying zip archives.
 func (z *Zip) Close() error {
 	if z.closed {
 		return nil
 	}
 	z.closed = true
-	return z.rc.Close()
+	var err error
+	for _, rz := range z.rzs {
+		err = errors.Join(err, rz.Close())
+	}
+	return err
 }
 
 // zipCleanPath maps a name to its absolute form within the virtual
@@ -249,6 +232,61 @@ func (z *Zip) Close() error {
 // separator on every platform.
 func zipCleanPath(name string) string {
 	return path.Clean("/" + name)
+}
+
+// indexEntry validates one archive entry and indexes it if usable. Entries
+// whose names cannot be made safe (escaping the virtual root, NUL bytes,
+// ...), or that are encrypted or use an unsupported compression method, are
+// skipped with a warning.
+func (z *Zip) indexEntry(fh *zip.File) {
+	name, ok := zipCleanEntryName(fh.Name, fh.NonUTF8)
+	if !ok {
+		z.warn("zip: entry %q ignored, unsafe or invalid path", fh.Name)
+		return
+	}
+
+	if fh.Flags&zipEncryptedFlag != 0 {
+		z.warn("zip: entry %q ignored, entry is encrypted", fh.Name)
+		return
+	}
+	if fh.Method != zip.Store && fh.Method != zip.Deflate {
+		z.warn("zip: entry %q ignored, unsupported compression method %d", fh.Name, fh.Method)
+		return
+	}
+
+	mode := fh.Mode()
+	isDir := mode.IsDir()
+	isSymlink := mode&os.ModeSymlink != 0
+
+	mtime := fh.Modified.UTC()
+	e := &zipEntry{
+		path:   name,
+		isDir:  isDir,
+		header: fh,
+		fi: &ExtendedFileInfo{
+			Name:       path.Base(name),
+			ModTime:    mtime,
+			AccessTime: mtime,
+			ChangeTime: mtime,
+		},
+	}
+	if isSymlink {
+		target, err := readSymlinkTarget(fh)
+		if err != nil {
+			z.warn("zip: entry %q ignored: %v", fh.Name, err)
+			return
+		}
+		e.linkTarget = target
+		e.fi.Mode = os.ModeSymlink | 0o777
+		e.fi.Size = int64(len(target))
+	} else {
+		e.fi.Mode = zipEntryMode(fh, isDir)
+		if !isDir {
+			e.fi.Size = int64(fh.UncompressedSize64)
+		}
+	}
+
+	z.addEntry(e)
 }
 
 // zipCleanEntryName normalizes a raw zip entry name to an absolute path
