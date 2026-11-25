@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"archive/tar"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -118,4 +119,37 @@ func TestMigrateUnsupportedFormat(t *testing.T) {
 	test.Assert(t, err != nil, "expected an error when one archive is unsupported")
 
 	test.Equals(t, 0, len(warnings))
+}
+
+// TestMigrateArchiveInfo verifies that NewMigrate records, for every
+// archive, the detected format label and the number of entries that were
+// indexed and skipped, and that Archives() reports them in the order the
+// archives were given.
+func TestMigrateArchiveInfo(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "a.zip")
+	writeTestZip(t, zipPath, []zipTestFile{
+		{name: "ok.txt", content: []byte("zip kept")},
+	})
+	tarPath := filepath.Join(dir, "b.tar.gz")
+	writeTestTar(t, tarPath, "gz", []tarTestEntry{
+		{name: "d/", mode: 0o755, typ: tar.TypeDir},
+		{name: "d/kept.txt", content: []byte("tar kept"), mode: 0o644},
+		{name: "../escape.txt", content: []byte("skipped"), mode: 0o644},
+	})
+
+	var warnings []string
+	m := openTestMigrate(t, []string{zipPath, tarPath}, &warnings)
+	test.Equals(t, 1, len(warnings))
+
+	infos := m.Archives()
+	test.Equals(t, 2, len(infos))
+	test.Equals(t, zipPath, infos[0].Path)
+	test.Equals(t, "zip", infos[0].Label)
+	test.Equals(t, 1, infos[0].Indexed)
+	test.Equals(t, 0, infos[0].Skipped)
+	test.Equals(t, tarPath, infos[1].Path)
+	test.Equals(t, "tar.gz", infos[1].Label)
+	test.Equals(t, 2, infos[1].Indexed)
+	test.Equals(t, 1, infos[1].Skipped)
 }
