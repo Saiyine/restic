@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/test"
 	"github.com/ulikunitz/xz"
 )
@@ -648,4 +649,104 @@ func TestTarProbeFormats(t *testing.T) {
 	test.Assert(t, err != nil, "expected an error for an unsupported format")
 	test.Assert(t, strings.Contains(err.Error(), "unsupported archive format"),
 		"unexpected error %v", err)
+}
+
+// TestTarPaxTimesAndXattrs verifies that atime/ctime stored in the archive
+// (PAX atime/ctime records) and extended attributes (PAX SCHILY.xattr.*
+// records, including the octal-escaped form for non-printable values) are
+// exposed by the virtual filesystem; entries without them fall back to
+// the mtime.
+func TestTarPaxTimesAndXattrs(t *testing.T) {
+	atimeVal := time.Date(2022, 3, 4, 5, 6, 7, 0, time.UTC)
+	ctimeVal := time.Date(2023, 4, 5, 6, 7, 8, 0, time.UTC)
+
+	path := filepath.Join(t.TempDir(), "pax.tar")
+	f, err := os.Create(path)
+	test.OK(t, err)
+	tw := tar.NewWriter(f)
+	write := func(hdr *tar.Header, content string) {
+		test.OK(t, tw.WriteHeader(hdr))
+		if content != "" {
+			var n int
+			n, err = tw.Write([]byte(content))
+			test.OK(t, err)
+			test.Assert(t, n == len(content), "short write")
+		}
+	}
+
+	// explicit atime and ctime (only written with an explicit PAX format)
+	write(&tar.Header{
+		Name: "times.txt", Mode: 0o644, Size: int64(len("with times\n")),
+		ModTime: modTimeA, AccessTime: atimeVal, ChangeTime: ctimeVal,
+		Format: tar.FormatPAX,
+	}, "with times\n")
+
+	// no atime/ctime stored: must fall back to the mtime
+	write(&tar.Header{
+		Name: "plain.txt", Mode: 0o644, Size: int64(len("plain\n")),
+		ModTime: modTimeB,
+		Format:  tar.FormatPAX,
+	}, "plain\n")
+
+	// extended attributes: one plain value, one octal-escaped
+	// (backslash + 0231 001 = bytes 0x99 0x01, the PAX encoding of
+	// non-printable values)
+	write(&tar.Header{
+		Name: "xattr.txt", Mode: 0o644, Size: int64(len("attrs\n")),
+		ModTime: modTimeA,
+		Format:  tar.FormatPAX,
+		Xattrs:  map[string]string{"user.plain": "plain-value"},
+		PAXRecords: map[string]string{
+			"SCHILY.xattr.user.raw": "\\231001",
+		},
+	}, "attrs\n")
+
+	// a directory with an extended attribute
+	write(&tar.Header{
+		Name: "dir/", Mode: 0o755,
+		ModTime: modTimeA,
+		Format:  tar.FormatPAX,
+		Xattrs:  map[string]string{"user.dir": "dir-value"},
+	}, "")
+
+	test.OK(t, tw.Close())
+	test.OK(t, f.Close())
+
+	var warnings []string
+	m := openTestMigrate(t, []string{path}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	fi, err := m.Lstat("/times.txt")
+	test.OK(t, err)
+	test.Equals(t, atimeVal, fi.AccessTime)
+	test.Equals(t, ctimeVal, fi.ChangeTime)
+	test.Equals(t, modTimeA, fi.ModTime)
+
+	fi, err = m.Lstat("/plain.txt")
+	test.OK(t, err)
+	test.Equals(t, modTimeB, fi.AccessTime)
+	test.Equals(t, modTimeB, fi.ChangeTime)
+	test.Equals(t, modTimeB, fi.ModTime)
+
+	toNode := func(name string) *data.Node {
+		f, err := m.OpenFile(name, O_RDONLY|O_NOFOLLOW, false)
+		test.OK(t, err)
+		node, err := f.ToNode(false, func(format string, args ...any) {
+			warnings = append(warnings, fmt.Sprintf(format, args...))
+		})
+		test.OK(t, err)
+		test.OK(t, f.Close())
+		return node
+	}
+
+	node := toNode("/xattr.txt")
+	test.Equals(t, []data.ExtendedAttribute{
+		{Name: "user.plain", Value: []byte("plain-value")},
+		{Name: "user.raw", Value: []byte{0x99, 0x01}},
+	}, node.ExtendedAttributes)
+
+	node = toNode("/dir")
+	test.Equals(t, []data.ExtendedAttribute{
+		{Name: "user.dir", Value: []byte("dir-value")},
+	}, node.ExtendedAttributes)
 }

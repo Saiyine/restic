@@ -770,3 +770,64 @@ func patchZip64Central(t testing.TB, zipPath, name string) {
 
 	test.OK(t, os.WriteFile(zipPath, data, 0o644))
 }
+
+// TestZipExtTimes verifies that the access and change times stored in the
+// zip "Extended timestamp" extra field (0x5455) are exposed, while an
+// entry without that field falls back to the mtime.
+func TestZipExtTimes(t *testing.T) {
+	atimeVal := time.Date(2022, 3, 4, 5, 6, 7, 0, time.UTC)
+	ctimeVal := time.Date(2023, 4, 5, 6, 7, 8, 0, time.UTC)
+
+	// an "Extended timestamp" extra block carrying mtime, atime and
+	// ctime: flags (1), then each time as a big-endian uint32 in the
+	// order mtime, atime, ctime
+	mkExtTime := func() []byte {
+		var b [17]byte
+		binary.LittleEndian.PutUint16(b[0:2], 0x5455)
+		binary.LittleEndian.PutUint16(b[2:4], 13)
+		b[4] = 0x07 // flags: mtime|atime|ctime
+		binary.BigEndian.PutUint32(b[5:9], uint32(modTimeA.Unix()))
+		binary.BigEndian.PutUint32(b[9:13], uint32(atimeVal.Unix()))
+		binary.BigEndian.PutUint32(b[13:17], uint32(ctimeVal.Unix()))
+		return b[:]
+	}
+
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "ext.zip")
+	f, err := os.Create(zipPath)
+	test.OK(t, err)
+	zw := zip.NewWriter(f)
+
+	hdr := &zip.FileHeader{Name: "with-times.bin", Modified: modTimeA}
+	hdr.Extra = mkExtTime()
+	w, err := zw.CreateHeader(hdr)
+	test.OK(t, err)
+	_, err = w.Write([]byte("with ext times\n"))
+	test.OK(t, err)
+
+	w, err = zw.CreateHeader(&zip.FileHeader{
+		Name: "no-times.bin", Modified: modTimeB,
+	})
+	test.OK(t, err)
+	_, err = w.Write([]byte("no ext times\n"))
+	test.OK(t, err)
+
+	test.OK(t, zw.Close())
+	test.OK(t, f.Close())
+
+	var warnings []string
+	m := openTestZip(t, zipPath, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	fi, err := m.Lstat("/with-times.bin")
+	test.OK(t, err)
+	test.Equals(t, atimeVal, fi.AccessTime)
+	test.Equals(t, ctimeVal, fi.ChangeTime)
+	test.Equals(t, modTimeA, fi.ModTime)
+
+	fi, err = m.Lstat("/no-times.bin")
+	test.OK(t, err)
+	test.Equals(t, modTimeB, fi.AccessTime)
+	test.Equals(t, modTimeB, fi.ChangeTime)
+	test.Equals(t, modTimeB, fi.ModTime)
+}
