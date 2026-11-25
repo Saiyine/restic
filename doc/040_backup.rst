@@ -787,10 +787,12 @@ another, the first occurrence is kept and the conflicting entry is skipped
 with a warning.
 
 Tar archives are recognized by their content and may be plain (``.tar``),
-gzipped (``.tar.gz`` / ``.tgz``) or xz-compressed (``.tar.xz`` / ``.txz``). A
-gzipped or xz-compressed file that does not contain a tar archive is backed
-up as a single virtual file named after the archive without the compression
-suffix (e.g. ``report.gz`` becomes ``/report``).
+gzipped (``.tar.gz`` / ``.tgz``), xz-compressed (``.tar.xz`` / ``.txz``),
+bzip2-compressed (``.tar.bz2`` / ``.tbz``) or zstd-compressed
+(``.tar.zst`` / ``.tzst``). A compressed file (gzip, xz, bzip2 or zstd) that
+does not contain a tar archive is backed up as a single virtual file named
+after the archive without the compression suffix (e.g. ``report.gz`` becomes
+``/report``).
 
 Only the archives themselves are read: entry contents are decompressed on the
 fly while the backup runs, so memory usage stays bounded no matter how large

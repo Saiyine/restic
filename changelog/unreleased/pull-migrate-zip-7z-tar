@@ -21,13 +21,14 @@ For 7z archives, the common compression methods are supported
 BCJ filters and stored data); encrypted or unsupported entries are
 skipped with a warning.
 
-Tar archives may be plain (`.tar`), gzipped (`.tar.gz`, `.tgz`) or
-xz-compressed (`.tar.xz`, `.txz`); tar entries that are unsafe (escape
-the archive root, contain NUL bytes) are skipped with a warning,
-absolute paths are re-rooted inside the virtual filesystem, and hard
-links are backed up as copies of their target's content. A gzipped or
-xz-compressed file that does not contain a tar archive is backed up as
-a single virtual file named after the archive without the compression
-suffix (e.g. `report.gz` becomes `/report`).
+Tar archives may be plain (`.tar`), or compressed with gzip (`.tar.gz`,
+`.tgz`), xz (`.tar.xz`, `.txz`), bzip2 (`.tar.bz2`, `.tbz`) or zstd
+(`.tar.zst`, `.tzst`); tar entries that are unsafe (escape the archive
+root, contain NUL bytes) are skipped with a warning, absolute paths are
+re-rooted inside the virtual filesystem, and hard links are backed up as
+copies of their target's content. A compressed file (gzip, xz, bzip2 or
+zstd) that does not contain a tar archive is backed up as a single
+virtual file named after the archive without the compression suffix
+(e.g. `report.gz` becomes `/report`).
 
 https://github.com/Saiyine/restic

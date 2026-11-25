@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	rtest "github.com/restic/restic/internal/test"
 	"github.com/ulikunitz/xz"
 )
@@ -584,8 +585,8 @@ func TestBackupMigrateMixedZipSevenZip(t *testing.T) {
 
 // makeTestTar creates a tar archive at tarPath containing the content of
 // srcDir with relative entry names (as `tar -cf out.tar -C srcDir .`),
-// preserving file modes and modification times. When format is "w:gz" or
-// "w:xz" the archive is compressed with gzip or xz.
+// preserving file modes and modification times. When format is "w:gz",
+// "w:xz" or "w:zst" the archive is compressed with gzip, xz or zstd.
 func makeTestTar(t testing.TB, srcDir, tarPath, format string) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -642,6 +643,11 @@ func makeTestTar(t testing.TB, srcDir, tarPath, format string) {
 		rtest.OK(t, err)
 		out = xzw
 		closeOut = xzw
+	case "w:zst":
+		zsw, err := zstd.NewWriter(f)
+		rtest.OK(t, err)
+		out = zsw
+		closeOut = zsw
 	}
 	_, err = io.Copy(out, &buf)
 	rtest.OK(t, err)
@@ -651,11 +657,11 @@ func makeTestTar(t testing.TB, srcDir, tarPath, format string) {
 }
 
 // TestBackupMigrateTar backs up a tar archive in each of its plain,
-// gzipped and xz-compressed forms and verifies that the snapshot matches the
-// archive entries and that a restore reproduces the source tree (content,
-// modes and mtimes).
+// gzipped, xz-compressed and zstd-compressed forms and verifies that the
+// snapshot matches the archive entries and that a restore reproduces the
+// source tree (content, modes and mtimes).
 func TestBackupMigrateTar(t *testing.T) {
-	for _, format := range []string{"w", "w:gz", "w:xz"} {
+	for _, format := range []string{"w", "w:gz", "w:xz", "w:zst"} {
 		t.Run(format, func(t *testing.T) {
 			env, cleanup := withTestEnvironment(t)
 			defer cleanup()
@@ -665,12 +671,16 @@ func TestBackupMigrateTar(t *testing.T) {
 			rtest.OK(t, os.MkdirAll(srcDir, 0o755))
 			createMigrateSourceTree(t, srcDir)
 
-			suffix := ".tar"
-			if format == "w:gz" {
+			var suffix string
+			switch format {
+			case "w:gz":
 				suffix = ".tar.gz"
-			}
-			if format == "w:xz" {
+			case "w:xz":
 				suffix = ".tar.xz"
+			case "w:zst":
+				suffix = ".tar.zst"
+			default:
+				suffix = ".tar"
 			}
 			tarPath := filepath.Join(env.base, "archive"+suffix)
 			makeTestTar(t, srcDir, tarPath, format)
@@ -706,58 +716,128 @@ func TestBackupMigrateTar(t *testing.T) {
 	}
 }
 
-// TestBackupMigrateStandaloneGzXz backs up .gz and .xz files that do not
-// contain a tar archive: each file is stored as a single virtual file named
-// after the archive, without the compression suffix.
-func TestBackupMigrateStandaloneGzXz(t *testing.T) {
-	env, cleanup := withTestEnvironment(t)
-	defer cleanup()
-	testRunInit(t, env.gopts)
-
-	gzPath := filepath.Join(env.base, "report.gz")
-	f, err := os.Create(gzPath)
-	rtest.OK(t, err)
-	gz := gzip.NewWriter(f)
-	_, err = gz.Write([]byte("gzip report content\n"))
-	rtest.OK(t, err)
-	rtest.OK(t, gz.Close())
-	rtest.OK(t, f.Close())
-
-	xzPath := filepath.Join(env.base, "notes.xz")
-	f, err = os.Create(xzPath)
-	rtest.OK(t, err)
-	xzw, err := xz.NewWriter(f)
-	rtest.OK(t, err)
-	_, err = xzw.Write([]byte("xz notes content\n"))
-	rtest.OK(t, err)
-	rtest.OK(t, xzw.Close())
-	rtest.OK(t, f.Close())
-
-	opts := BackupOptions{Migrate: []string{gzPath, xzPath}}
-	testRunBackup(t, "", nil, opts, env.gopts)
-	snapshotIDs := testListSnapshots(t, env.gopts, 1)
-
-	ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
-	t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
-	for _, p := range []string{"/report", "/notes"} {
-		found := false
-		for _, line := range ls {
-			if strings.HasSuffix(line, p) {
-				found = true
-				break
-			}
+// TestBackupMigrateStandaloneCompressed backs up standalone compressed
+// files that do not contain a tar archive: each file is stored as a single
+// virtual file named after the archive, without the compression suffix.
+// gzip, xz and zstd files are built in memory; bzip2 has no writer in Go, so
+// the committed unit-test fixture gamma.bz2 is used for it.
+func TestBackupMigrateStandaloneCompressed(t *testing.T) {
+	// writeStandalone creates report.<ext> in dir with the given content,
+	// compressed with the codec named by ext.
+	writeStandalone := func(t *testing.T, dir, name, ext, content string) string {
+		t.Helper()
+		path := filepath.Join(dir, name+"."+ext)
+		f, err := os.Create(path)
+		rtest.OK(t, err)
+		var wc io.WriteCloser
+		switch ext {
+		case "gz":
+			wc = gzip.NewWriter(f)
+		case "xz":
+			wc, err = xz.NewWriter(f)
+			rtest.OK(t, err)
+		case "zst":
+			wc, err = zstd.NewWriter(f)
+			rtest.OK(t, err)
 		}
-		rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+		_, err = wc.Write([]byte(content))
+		rtest.OK(t, err)
+		rtest.OK(t, wc.Close())
+		rtest.OK(t, f.Close())
+		return path
 	}
 
-	restoredir := filepath.Join(env.base, "restore")
-	testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
-	report, err := os.ReadFile(filepath.Join(restoredir, "report"))
-	rtest.OK(t, err)
-	rtest.Equals(t, "gzip report content\n", string(report))
-	notes, err := os.ReadFile(filepath.Join(restoredir, "notes"))
-	rtest.OK(t, err)
-	rtest.Equals(t, "xz notes content\n", string(notes))
+	// assertStandaloneSnapshot verifies that the snapshot lists and
+	// restores the given virtual file with the given content.
+	assertStandaloneSnapshot := func(t *testing.T, env *testEnvironment, name, content string) {
+		snapshotIDs := testListSnapshots(t, env.gopts, 1)
+		ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+		t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+		found := false
+		for _, line := range ls {
+			if strings.HasSuffix(line, "/"+name) {
+				found = true
+			}
+		}
+		rtest.Assert(t, found, "ls: /%s not found in snapshot", name)
 
-	testRunCheck(t, env.gopts)
+		restoredir := filepath.Join(env.base, "restore")
+		testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+		got, err := os.ReadFile(filepath.Join(restoredir, name))
+		rtest.OK(t, err)
+		rtest.Equals(t, content, string(got))
+
+		testRunCheck(t, env.gopts)
+	}
+
+	for _, tc := range []struct {
+		ext, content string
+	}{
+		{"gz", "gzip report content\n"},
+		{"xz", "xz report content\n"},
+		{"zst", "zstd report content\n"},
+	} {
+		t.Run(tc.ext, func(t *testing.T) {
+			env, cleanup := withTestEnvironment(t)
+			defer cleanup()
+			testRunInit(t, env.gopts)
+
+			path := writeStandalone(t, env.base, "report", tc.ext, tc.content)
+			opts := BackupOptions{Migrate: []string{path}}
+			testRunBackup(t, "", nil, opts, env.gopts)
+			assertStandaloneSnapshot(t, env, "report", tc.content)
+		})
+	}
+
+	// bzip2 has no writer in Go: use the committed unit-test fixture
+	t.Run("bz2", func(t *testing.T) {
+		env, cleanup := withTestEnvironment(t)
+		defer cleanup()
+		testRunInit(t, env.gopts)
+
+		fixture := filepath.Join("..", "..", "internal", "fs", "testdata", "tar", "gamma.bz2")
+		opts := BackupOptions{Migrate: []string{fixture}}
+		testRunBackup(t, "", nil, opts, env.gopts)
+		assertStandaloneSnapshot(t, env, "gamma", "bzip2 standalone content\n")
+	})
+
+	// several archives of different codecs in a single snapshot
+	t.Run("mixed", func(t *testing.T) {
+		env, cleanup := withTestEnvironment(t)
+		defer cleanup()
+		testRunInit(t, env.gopts)
+
+		gzPath := writeStandalone(t, env.base, "report", "gz", "gzip report content\n")
+		xzPath := writeStandalone(t, env.base, "notes", "xz", "xz notes content\n")
+		fixture := filepath.Join("..", "..", "internal", "fs", "testdata", "tar", "gamma.bz2")
+		opts := BackupOptions{Migrate: []string{gzPath, xzPath, fixture}}
+		testRunBackup(t, "", nil, opts, env.gopts)
+
+		snapshotIDs := testListSnapshots(t, env.gopts, 1)
+		ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+		t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+		for _, p := range []string{"/report", "/notes", "/gamma"} {
+			found := false
+			for _, line := range ls {
+				if strings.HasSuffix(line, p) {
+					found = true
+				}
+			}
+			rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+		}
+
+		restoredir := filepath.Join(env.base, "restore")
+		testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+		report, err := os.ReadFile(filepath.Join(restoredir, "report"))
+		rtest.OK(t, err)
+		rtest.Equals(t, "gzip report content\n", string(report))
+		notes, err := os.ReadFile(filepath.Join(restoredir, "notes"))
+		rtest.OK(t, err)
+		rtest.Equals(t, "xz notes content\n", string(notes))
+		gamma, err := os.ReadFile(filepath.Join(restoredir, "gamma"))
+		rtest.OK(t, err)
+		rtest.Equals(t, "bzip2 standalone content\n", string(gamma))
+
+		testRunCheck(t, env.gopts)
+	})
 }

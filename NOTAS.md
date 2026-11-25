@@ -308,3 +308,45 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
   zip, 7z and tar archives" y ampliada (tar plano/gz/xz, .gz/.xz
   sueltos, hard links, reglas de nombres); changelog movido a
   `pull-migrate-zip-7z-tar` y ampliado en consecuencia.
+
+### A10 — bzip2 y zstd (`.tar.bz2`/`.tbz`, `.tar.zst`/`.tzst`, sueltos)
+
+- Qué hice: `--migrate` ahora acepta también archives tar comprimidos con
+  bzip2 (`.tar.bz2`/`.tbz`) y zstd (`.tar.zst`/`.tzst`), y cualquier
+  fichero `.bz2`/`.zst` que no contenga un tar como único fichero virtual
+  (misma regla que .gz/.xz; mtime = mtime del fichero, pues esos formatos
+  no guardan mtime). Misma forma que A9: dos magics nuevos en
+  `probeArchive` (bzip2 `42 5A 68` = "BZh" — el magic `1D 00 B0` era un
+  error mío detectado al generar los fixtures; zstd `28 B5 2F FD`), dos
+  `case` nuevos en `openTarStream` (`compress/bzip2.NewReader` de la
+  stdlib, `zstd.NewReader` de klauspost) envueltos en un
+  `fileReadCloser` (el reader de bzip2 no tiene Close y el decodificador
+  zstd no cierra su input), `tarLabel`/`singleLabel` extendidos y
+  `singleFileName` con los sufijos `.tar.bz2`/`.tbz`/`.tbz2`/`.bz2` y
+  `.tar.zst`/`.tzst`/`.zst`. El cursor de avance y las lecturas limitadas
+  son agnósticos del codec: sin cambios. **Cero deps nuevas**: bzip2 va en
+  la stdlib y `klauspost/compress` ya era dependencia directa (compresión
+  por defecto de restic).
+- Testdata: 4 fixtures nuevos en `internal/fs/testdata/tar/`
+  (`bz2.tar.bz2`, `zst.tar.zst`, `gamma.bz2`, `delta.zst`) + `generate.py`
+  extendido (bz2 de la stdlib; zstd con el paquete `zstandard`, solo para
+  regenerar — los fixtures van commiteados; README actualizado).
+- Tests: 6 unitarios nuevos (`TestTar{Bzip2,Zstd,StandaloneBz2,StandaloneZst,CorruptBz2,CorruptZst}`
+  — total 21 `TestTar*`); `TestTarPartialRead` y `TestTarProbeFormats`
+  ampliados a los 4 codecs; `writeTestTar` soporta wrap `zst` (bzip2 no:
+  la stdlib de Go no tiene writer — el fixture commiteado cubre los tests).
+  Integración: `TestBackupMigrateTar` ahora itera plain/gz/xz/zst
+  (restore byte a byte contra el árbol fuente) y
+  `TestBackupMigrateStandaloneGzXz` se ha reestructurado como
+  `TestBackupMigrateStandaloneCompressed` (subtests gz/xz/zst in-memory,
+  bz2 con el fixture commiteado vía path relativo
+  `../../internal/fs/testdata/tar/`, y un snapshot mixto con 3 codecs).
+- CLI: help del flag `--migrate` actualizado.
+- Docs/changelog: `040_backup.rst` (tar plano/gz/xz/bzip2/zstd + sueltos
+  de los 4 codecs), changelog ampliado en consecuencia.
+- QA: gofmt/vet limpios, `go test -race` fs+cmd/restic verde (110 s),
+  golangci-lint 0 issues, RST sin errores nuevos, cross-builds
+  windows/darwin ok. E2E manual: `backup --migrate src.tar.zst
+  --migrate log.bz2 --migrate data.zst` → `ls` correcto (/file1.txt,
+  /sub/file2.txt, /log, /data) y restore byte a byte con modos
+  (600/640) y mtimes exactos.

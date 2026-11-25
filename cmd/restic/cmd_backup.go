@@ -116,7 +116,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
-	f.StringArrayVar(&opts.Migrate, "migrate", nil, "back up the contents of the given `zip`, `7z` or `tar` archive(s) (tar optionally compressed with gzip or xz, plus standalone .gz/.xz files) in place, without extracting them to disk (can be specified multiple times)")
+	f.StringArrayVar(&opts.Migrate, "migrate", nil, "back up the contents of the given `zip`, `7z` or `tar` archive(s) (tar optionally compressed with gzip, xz, bzip2 or zstd, plus standalone .gz/.xz/.bz2/.zst files) in place, without extracting them to disk (can be specified multiple times)")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
 	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
