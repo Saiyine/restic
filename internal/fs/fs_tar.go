@@ -2,6 +2,7 @@ package fs
 
 import (
 	"archive/tar"
+	"compress/bzip2"
 	"compress/gzip"
 	"encoding/binary"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
 
@@ -24,6 +26,8 @@ const (
 	tarPlain tarCompression = iota
 	tarGzip
 	tarXz
+	tarBzip2
+	tarZstd
 )
 
 // tarLabel is the warning label of a tar-based archive with the given
@@ -34,8 +38,27 @@ func tarLabel(comp tarCompression) string {
 		return "tar.gz"
 	case tarXz:
 		return "tar.xz"
+	case tarBzip2:
+		return "tar.bz2"
+	case tarZstd:
+		return "tar.zst"
 	default:
 		return "tar"
+	}
+}
+
+// singleLabel is the warning label for a standalone (non-tar) compressed
+// file of the given wrapper.
+func singleLabel(comp tarCompression) string {
+	switch comp {
+	case tarXz:
+		return "xz"
+	case tarBzip2:
+		return "bz2"
+	case tarZstd:
+		return "zst"
+	default:
+		return "gz"
 	}
 }
 
@@ -47,6 +70,18 @@ type xzReadCloser struct {
 }
 
 func (c *xzReadCloser) Close() error {
+	return c.f.Close()
+}
+
+// fileReadCloser pairs a decompression reader with the file it reads from,
+// so that closing the reader also closes the file (the stdlib bzip2 reader
+// has no Close method and the zstd decoder does not close its input).
+type fileReadCloser struct {
+	io.Reader
+	f *os.File
+}
+
+func (c *fileReadCloser) Close() error {
 	return c.f.Close()
 }
 
@@ -74,6 +109,15 @@ func openTarStream(path string, comp tarCompression) (io.ReadCloser, error) {
 			return nil, err
 		}
 		return &xzReadCloser{Reader: xzr, f: f}, nil
+	case tarBzip2:
+		return &fileReadCloser{Reader: bzip2.NewReader(f), f: f}, nil
+	case tarZstd:
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &fileReadCloser{Reader: zr, f: f}, nil
 	}
 	_ = f.Close()
 	return nil, errors.New("internal error: unknown tar compression")
@@ -366,10 +410,7 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 // (e.g. "report.gz" becomes "/report"). A full decompression pass measures
 // the size of the uncompressed data and validates the stream.
 func (m *MigrateFS) openSingleFile(path string, comp tarCompression) error {
-	label := "gz"
-	if comp == tarXz {
-		label = "xz"
-	}
+	label := singleLabel(comp)
 
 	arc := &tarArchive{path: path, comp: comp}
 	m.addCloser(arc.closeStream)
@@ -411,7 +452,13 @@ func (m *MigrateFS) openSingleFile(path string, comp tarCompression) error {
 // file from the archive file name, stripping the compression suffix.
 func singleFileName(archivePath string) string {
 	base := path.Base(archivePath)
-	for _, suf := range []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".gz", ".xz"} {
+	for _, suf := range []string{
+		".tar.gz", ".tgz",
+		".tar.xz", ".txz",
+		".tar.bz2", ".tbz", ".tbz2",
+		".tar.zst", ".tzst",
+		".gz", ".xz", ".bz2", ".zst",
+	} {
 		if strings.HasSuffix(base, suf) {
 			if name := strings.TrimSuffix(base, suf); name != "" {
 				return name

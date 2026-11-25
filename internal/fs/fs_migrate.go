@@ -36,6 +36,8 @@ var (
 	sevenzipMagic = []byte{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}
 	gzipMagic     = []byte{0x1F, 0x8B}
 	xzMagic       = []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}
+	bzip2Magic    = []byte{0x42, 0x5A, 0x68} // "BZh"
+	zstdMagic     = []byte{0x28, 0xB5, 0x2F, 0xFD}
 	tarMagic      = []byte("ustar") // at offset 257 of the first tar block
 )
 
@@ -287,10 +289,10 @@ func readLinkTarget(size uint64, open func() (io.ReadCloser, error)) (string, er
 }
 
 // probeArchive reports the format of the archive at path: zip and 7z by
-// their leading magic bytes; tar (plain, gzipped or xz-compressed) by
-// sniffing the first 512 bytes of the (decompressed) content for the ustar
-// magic; and any other gzipped or xz-compressed file as a standalone
-// single-file archive.
+// their leading magic bytes; tar (plain, or compressed with gzip, xz, bzip2
+// or zstd) by sniffing the first 512 bytes of the (decompressed) content for
+// the ustar magic; and any other gzip/xz/bzip2/zstd-compressed file as a
+// standalone single-file archive.
 func probeArchive(path string) (archiveInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -315,6 +317,10 @@ func probeArchive(path string) (archiveInfo, error) {
 		return probeWrappedArchive(path, tarGzip)
 	case bytes.Equal(magic[:], xzMagic):
 		return probeWrappedArchive(path, tarXz)
+	case bytes.Equal(magic[:3], bzip2Magic):
+		return probeWrappedArchive(path, tarBzip2)
+	case bytes.Equal(magic[:4], zstdMagic):
+		return probeWrappedArchive(path, tarZstd)
 	}
 
 	// an uncompressed tar has no magic at the start: the ustar magic sits
@@ -359,10 +365,10 @@ func isTarBlock(buf []byte) bool {
 	return true
 }
 
-// probeWrappedArchive sniffs the decompressed content of a gzipped or
-// xz-compressed file: a tar inside, or a standalone file. A wrapper that
-// cannot be decompressed at all is classified as a standalone file so that
-// the indexing pass reports the actual error.
+// probeWrappedArchive sniffs the decompressed content of a compressed file
+// (gzip, xz, bzip2 or zstd): a tar inside, or a standalone file. A wrapper
+// that cannot be decompressed at all is classified as a standalone file so
+// that the indexing pass reports the actual error.
 func probeWrappedArchive(path string, comp tarCompression) (archiveInfo, error) {
 	rc, err := openTarStream(path, comp)
 	if err != nil {
@@ -378,10 +384,11 @@ func probeWrappedArchive(path string, comp tarCompression) (archiveInfo, error) 
 }
 
 // NewMigrate opens the archives at archivePaths (zip, 7z and tar in any
-// combination, with tar optionally compressed with gzip or xz, plus
-// standalone .gz/.xz files) and indexes their entries into a single virtual
-// filesystem. The format of each archive is detected by its magic bytes and,
-// for tar, by sniffing its content. The result is equivalent to a single
+// combination, with tar optionally compressed with gzip, xz, bzip2 or zstd,
+// plus standalone .gz/.xz/.bz2/.zst files) and indexes their entries into a
+// single virtual filesystem. The format of each archive is detected by its
+// magic bytes and, for tar, by sniffing its content. The result is
+// equivalent to a single
 // virtual archive whose entries are the concatenation of the entries of the
 // given archives, in the order given: the usual rules apply to the
 // concatenated entries (duplicate paths of the same type keep the last
