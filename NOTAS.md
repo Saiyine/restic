@@ -350,3 +350,55 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
   --migrate log.bz2 --migrate data.zst` → `ls` correcto (/file1.txt,
   /sub/file2.txt, /log, /data) y restore byte a byte con modos
   (600/640) y mtimes exactos.
+
+### A11 — atime/ctime + xattrs PAX en tar (y 0x5455 en zip)
+
+- Qué hice: los metadatos de tiempo más allá del mtime ahora viajan en el
+  snapshot. `archiveEntry` gana un campo `xattrs map[string][]byte` y
+  `nodeFromEntry` (fs_migrate.go) deja de hardcodear
+  `AccessTime=ChangeTime=ModTime`: usa los `AccessTime`/`ChangeTime`
+  reales del `ExtendedFileInfo` (y emite `data.Node.ExtendedAttributes`
+  con los nombres ordenados para nodos deterministas).
+  - tar (fs_tar.go): el lector de Go 1.26 ya rellena `hdr.AccessTime` /
+    `hdr.ChangeTime` (PAX `atime`/`ctime`, STAR y GNU) y
+    `hdr.Xattrs` (registros PAX `SCHILY.xattr.*`). El indexador ahora
+    los captura con tres helpers: `tarTimes` (fallback a mtime si el
+    archivo no los guarda), `tarXattrs` y `paxDecodeXattrValue` (decodifica
+    el escape octal del paxspec para valores no imprimibles: valor
+    inicial `\` + grupos de 3 dígitos octales, la forma que escribe GNU
+    tar; la stdlib de Go lo almacena crudo). Los hardlinks heredan
+    atime/ctime/xattrs del target (mismo inode).
+  - zip (fs_zip.go): el campo extra `0x5455` ("Extended timestamp", el
+    que escribe Info-ZIP y el propio writer de Go) lleva
+    `flags(1) + uint32 big-endian epoch` por tiempo presente (bit 0
+    mtime, bit 1 atime, bit 2 ctime). `zipExtTimes` lo parsea combinando
+    varios bloques (el writer de Go añade su propio bloque al lado del
+    del usuario) y usa el created-time como sustituto de ctime, pues zip
+    no tiene ctime propio. `mtime` sigue saliendo de `fh.Modified`
+    (la stdlib ya prefiere el 0x5455 al campo MS-DOS).
+  - 7z: la librería bodgit solo expone `Created` → sin cambios
+    (mtime).
+  - restore ya no toca nada: `restic restore` aplica
+    `NodeRestoreMetadata` → `setxattr` por cada xattr del snapshot y
+    `utimesNano` (atime+mtime) — el ctime queda en el snapshot pero el
+    kernel lo marca al restaurar (imposible fijarlo). El atime solo
+    se guarda si se usa `--with-atime` (comportamiento idéntico a un
+    backup normal: el archiver mapea atime→mtime sin la flag).
+- Tests: `TestTarPaxTimesAndXattrs` (tar in-memory con
+  `Format: tar.FormatPAX`: atime/ctime explícitos — la stdlib de Go los
+  ignora si el formato no se pide explícitamente —, entrada sin
+  atime/ctime → fallback a mtime, xattr plano + xattr octal-escapado
+  `\231001` → bytes 0x99 0x01, directorio con xattr) y
+  `TestZipExtTimes` (bloque 0x5455 manual con los 3 flags + entrada sin
+  campo). Integración: `TestBackupMigrateTarPaxTimesAndXattrs`
+  (subtests `with-atime` — restore verifica atime≠mtime, mtime exacto y
+  ambos xattrs en disco (el octal decodificado) — y `without-atime`,
+  donde atime colapsa a mtime); skip en no-Linux (atime/xattr en disco
+  son Linux-specific).
+- Docs/changelog: `040_backup.rst` (dos bullets nuevos en
+  "Notes and limitations": tiempos atime/ctime según formato +
+  `--with-atime`; xattrs PAX con decodificación octal) y changelog
+  ampliado.
+- QA: gofmt/vet limpios, `go test -race` fs+cmd/restic verde
+  (fs 3.4 s, cmd/restic 106.6 s), golangci-lint 0 issues, RST sin
+  errores nuevos, cross-builds windows/darwin ok.

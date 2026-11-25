@@ -821,6 +821,15 @@ Notes and limitations:
   linked file instead.
 * Hard links in tar archives are supported: the link is backed up as a copy
   of the content of the file it points to.
+* Access and change times: tar entries with PAX ``atime``/``ctime``
+  records (and the STAR and GNU equivalents) and zip entries with the
+  ``0x5455`` extended-timestamp extra field keep their stored access
+  and change times in the snapshot; all other entries fall back to
+  the modification time. As with regular directories, the access
+  time is only stored when the ``--with-atime`` option is used.
+* Extended attributes: tar entries with PAX ``SCHILY.xattr.*`` records
+  are backed up together with their (octal-decoded) values and
+  restored on the target file system.
 * 7z archives: the common compression methods are supported (LZMA, LZMA2,
   Zstd, Deflate, Bzip2, LZ4, Brotli, PPMD, Delta and BCJ filters, plus stored
   data). Encrypted entries, entries using an unsupported method, and entries

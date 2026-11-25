@@ -12,9 +12,14 @@ magic bytes and, for tar, by sniffing its content). The archives are never extra
 contents are decompressed on the fly and streamed to the repository,
 so memory usage stays bounded no matter how large the archives are.
 `restore` reproduces the entries byte for byte, including
-permissions and modification times. The archives are validated
-before the repository is opened, and the backup always behaves like
-`--force`, as the archives have no meaningful parent snapshot.
+permissions and modification times. Access and change times are
+also kept when the archive stores them (PAX `atime`/`ctime` records
+in tar, the `0x5455` extended-timestamp extra field in zip), and
+tar entries with PAX `SCHILY.xattr.*` records are backed up
+together with their extended attributes. The archives are
+validated before the repository is opened, and the backup always
+behaves like `--force`, as the archives have no meaningful parent
+snapshot.
 
 For 7z archives, the common compression methods are supported
 (LZMA, LZMA2, Zstd, Deflate, Bzip2, LZ4, Brotli, PPMD, Delta, the

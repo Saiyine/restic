@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/pkg/xattr"
 	rtest "github.com/restic/restic/internal/test"
 	"github.com/ulikunitz/xz"
 )
@@ -839,5 +841,120 @@ func TestBackupMigrateStandaloneCompressed(t *testing.T) {
 		rtest.Equals(t, "bzip2 standalone content\n", string(gamma))
 
 		testRunCheck(t, env.gopts)
+	})
+}
+
+// TestBackupMigrateTarPaxTimesAndXattrs backs up a tar archive whose
+// entries carry PAX access/change times and extended attributes (plain
+// and octal-escaped values) and verifies that a restore reproduces the
+// atime, mtime and xattrs. The ctime is stored in the snapshot, but the
+// kernel sets it to the restore time, so it is only checked at the
+// unit-test level.
+func TestBackupMigrateTarPaxTimesAndXattrs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("atime and xattr restore are Linux-specific")
+	}
+
+	mtimeVal := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	atimeVal := time.Date(2022, 3, 4, 5, 6, 7, 0, time.UTC)
+	ctimeVal := time.Date(2023, 4, 5, 6, 7, 8, 0, time.UTC)
+
+	makeTar := func(t *testing.T, dir string) string {
+		t.Helper()
+		tarPath := filepath.Join(dir, "pax.tar")
+		f, err := os.Create(tarPath)
+		rtest.OK(t, err)
+		tw := tar.NewWriter(f)
+		write := func(hdr *tar.Header, content string) {
+			rtest.OK(t, tw.WriteHeader(hdr))
+			if content != "" {
+				var n int
+				n, err = tw.Write([]byte(content))
+				rtest.OK(t, err)
+				rtest.Equals(t, len(content), n)
+			}
+		}
+		// PAX atime/ctime are only written with an explicit PAX format
+		write(&tar.Header{
+			Name: "times.txt", Mode: 0o644, Size: int64(len("with times\n")),
+			ModTime: mtimeVal, AccessTime: atimeVal, ChangeTime: ctimeVal,
+			Format: tar.FormatPAX,
+		}, "with times\n")
+		// extended attributes: one plain value and one octal-escaped
+		// (backslash + 0231 001 = bytes 0x99 0x01)
+		write(&tar.Header{
+			Name: "xattr.txt", Mode: 0o644, Size: int64(len("attrs\n")),
+			ModTime: mtimeVal,
+			Format:  tar.FormatPAX,
+			Xattrs:  map[string]string{"user.plain": "plain-value"},
+			PAXRecords: map[string]string{
+				"SCHILY.xattr.user.raw": "\\231001",
+			},
+		}, "attrs\n")
+		rtest.OK(t, tw.Close())
+		rtest.OK(t, f.Close())
+		return tarPath
+	}
+
+	t.Run("with-atime", func(t *testing.T) {
+		env, cleanup := withTestEnvironment(t)
+		defer cleanup()
+		testRunInit(t, env.gopts)
+
+		tarPath := makeTar(t, env.base)
+		opts := BackupOptions{Migrate: []string{tarPath}, WithAtime: true}
+		testRunBackup(t, "", nil, opts, env.gopts)
+		snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+		ls := testRunLs(t, env.gopts, snapshotIDs[0].String())
+		t.Logf("ls output:\n%s", strings.Join(ls, "\n"))
+		for _, p := range []string{"/times.txt", "/xattr.txt"} {
+			found := false
+			for _, line := range ls {
+				if strings.HasSuffix(line, p) {
+					found = true
+				}
+			}
+			rtest.Assert(t, found, "ls: %q not found in snapshot", p)
+		}
+
+		restoredir := filepath.Join(env.base, "restore")
+		testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+
+		fi, err := os.Stat(filepath.Join(restoredir, "times.txt"))
+		rtest.OK(t, err)
+		rtest.Equals(t, mtimeVal.Unix(), fi.ModTime().Unix(), "mtime")
+		rtest.Equals(t, atimeVal.Unix(), fi.Sys().(*syscall.Stat_t).Atim.Sec, "atime")
+
+		// the octal-escaped PAX value must be restored decoded
+		plain, err := xattr.LGet(filepath.Join(restoredir, "xattr.txt"), "user.plain")
+		rtest.OK(t, err)
+		rtest.Equals(t, "plain-value", string(plain))
+		raw, err := xattr.LGet(filepath.Join(restoredir, "xattr.txt"), "user.raw")
+		rtest.OK(t, err)
+		rtest.Equals(t, []byte{0x99, 0x01}, raw)
+
+		testRunCheck(t, env.gopts)
+	})
+
+	// without --with-atime the archiver maps atime to mtime, as for
+	// regular directories
+	t.Run("without-atime", func(t *testing.T) {
+		env, cleanup := withTestEnvironment(t)
+		defer cleanup()
+		testRunInit(t, env.gopts)
+
+		tarPath := makeTar(t, env.base)
+		opts := BackupOptions{Migrate: []string{tarPath}}
+		testRunBackup(t, "", nil, opts, env.gopts)
+		snapshotIDs := testListSnapshots(t, env.gopts, 1)
+
+		restoredir := filepath.Join(env.base, "restore")
+		testRunRestore(t, env.gopts, restoredir, snapshotIDs[0].String())
+
+		fi, err := os.Stat(filepath.Join(restoredir, "times.txt"))
+		rtest.OK(t, err)
+		rtest.Equals(t, mtimeVal.Unix(), fi.ModTime().Unix(), "mtime")
+		rtest.Equals(t, mtimeVal.Unix(), fi.Sys().(*syscall.Stat_t).Atim.Sec, "atime collapsed to mtime")
 	})
 }
