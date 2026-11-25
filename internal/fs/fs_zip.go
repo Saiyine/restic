@@ -2,10 +2,12 @@ package fs
 
 import (
 	"archive/zip"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path"
 	"strings"
+	"time"
 )
 
 // zipCreatorUnix and zipCreatorMacOSX mirror the creator-version values used
@@ -143,6 +145,14 @@ func (m *MigrateFS) indexZipEntry(fh *zip.File) {
 	isSymlink := mode&os.ModeSymlink != 0
 
 	mtime := fh.Modified.UTC()
+	extAtime, extCtime := zipExtTimes(fh.Extra)
+	atime, ctime := mtime, mtime
+	if !extAtime.IsZero() {
+		atime = extAtime
+	}
+	if !extCtime.IsZero() {
+		ctime = extCtime
+	}
 	e := &archiveEntry{
 		path:  name,
 		isDir: isDir,
@@ -150,8 +160,8 @@ func (m *MigrateFS) indexZipEntry(fh *zip.File) {
 		fi: &ExtendedFileInfo{
 			Name:       path.Base(name),
 			ModTime:    mtime,
-			AccessTime: mtime,
-			ChangeTime: mtime,
+			AccessTime: atime,
+			ChangeTime: ctime,
 		},
 	}
 	if isSymlink {
@@ -185,4 +195,46 @@ func zipEntryMode(fh *zip.File, isDir bool) os.FileMode {
 		return os.ModeDir | 0o755
 	}
 	return 0o644
+}
+
+// extTimeExtraTag is the zip extra-field tag that carries Unix
+// timestamps ("Extended timestamp" block, as written by Info-ZIP and by
+// Go's zip writer).
+const extTimeExtraTag = 0x5455
+
+// zipExtTimes returns the entry's extended-timestamp access and change
+// times from the 0x5455 extra fields, if any of them carries them. Each
+// block's first byte flags which times are present (bit 0 mtime, bit 1
+// atime, bit 2 ctime), stored in that order as big-endian uint32 Unix
+// seconds. The blocks' mtimes are ignored: archive/zip already prefers
+// them over the MS-DOS field for ModTime.
+func zipExtTimes(extra []byte) (atime, ctime time.Time) {
+	for len(extra) >= 4 {
+		tag := binary.LittleEndian.Uint16(extra[:2])
+		size := int(binary.LittleEndian.Uint16(extra[2:4]))
+		if size < 1 || len(extra) < 4+size {
+			return
+		}
+		if tag == extTimeExtraTag {
+			p := extra[4 : 4+size]
+			flags := p[0]
+			i := 1
+			if flags&0x01 != 0 && size-i >= 4 { // mtime
+				i += 4
+			}
+			if flags&0x02 != 0 && size-i >= 4 { // atime
+				if a := time.Unix(int64(binary.BigEndian.Uint32(p[i:i+4])), 0).UTC(); atime.IsZero() {
+					atime = a
+				}
+				i += 4
+			}
+			if flags&0x04 != 0 && size-i >= 4 { // ctime
+				if c := time.Unix(int64(binary.BigEndian.Uint32(p[i:i+4])), 0).UTC(); ctime.IsZero() {
+					ctime = c
+				}
+			}
+		}
+		extra = extra[4+size:]
+	}
+	return
 }

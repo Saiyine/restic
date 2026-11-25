@@ -59,6 +59,7 @@ type archiveEntry struct {
 	linkTarget string // only for symlinks
 	fi         *ExtendedFileInfo
 	content    func() (io.ReadCloser, error) // nil for directories
+	xattrs     map[string][]byte             // extended attributes, when the archive format stores them
 }
 
 // MigrateFS is a read-only filesystem view over the entries of one or more
@@ -454,9 +455,10 @@ func (m *MigrateFS) OpenFile(name string, flag int, _ bool) (File, error) {
 
 	if e.isDir {
 		return &migrateDir{
-			name:  name,
-			fi:    e.fi,
-			names: slices.Clone(m.children[name]),
+			name:   name,
+			fi:     e.fi,
+			names:  slices.Clone(m.children[name]),
+			xattrs: e.xattrs,
 		}, nil
 	}
 	return &migrateFile{
@@ -520,12 +522,26 @@ func (m *MigrateFS) Base(p string) string {
 // consistent.
 func nodeFromEntry(name string, e *archiveEntry) *data.Node {
 	node := buildBasicNode(name, e.fi)
-	node.AccessTime = e.fi.ModTime
-	node.ChangeTime = e.fi.ModTime
+	// atime and ctime fall back to the mtime for archive entries that do
+	// not store them; the archiver maps atime to mtime unless --with-atime
+	node.AccessTime = e.fi.AccessTime
+	node.ChangeTime = e.fi.ChangeTime
 	if e.fi.Mode&os.ModeSymlink != 0 {
 		node.LinkTarget = e.linkTarget
 		if !utf8.ValidString(e.linkTarget) {
 			node.LinkTargetRaw = []byte(e.linkTarget)
+		}
+	}
+	if len(e.xattrs) > 0 {
+		// sorted names: deterministic node content and snapshot trees
+		names := make([]string, 0, len(e.xattrs))
+		for n := range e.xattrs {
+			names = append(names, n)
+		}
+		slices.Sort(names)
+		node.ExtendedAttributes = make([]data.ExtendedAttribute, 0, len(names))
+		for _, n := range names {
+			node.ExtendedAttributes = append(node.ExtendedAttributes, data.ExtendedAttribute{Name: n, Value: e.xattrs[n]})
 		}
 	}
 	return node
@@ -608,9 +624,10 @@ func (f *migrateFile) ToNode(_ bool, _ func(format string, args ...any)) (*data.
 
 // migrateDir is a directory of the virtual filesystem.
 type migrateDir struct {
-	name  string
-	fi    *ExtendedFileInfo
-	names []string
+	name   string
+	fi     *ExtendedFileInfo
+	names  []string
+	xattrs map[string][]byte
 }
 
 // statically ensure that migrateDir implements File.
@@ -646,7 +663,7 @@ func (d *migrateDir) Stat() (*ExtendedFileInfo, error) {
 
 // ToNode implements File.
 func (d *migrateDir) ToNode(_ bool, _ func(format string, args ...any)) (*data.Node, error) {
-	return nodeFromEntry(d.name, &archiveEntry{path: d.name, isDir: true, fi: d.fi}), nil
+	return nodeFromEntry(d.name, &archiveEntry{path: d.name, isDir: true, fi: d.fi, xattrs: d.xattrs}), nil
 }
 
 // statically ensure that MigrateFS implements FS.

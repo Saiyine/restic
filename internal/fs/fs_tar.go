@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -330,15 +331,18 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 	}
 
 	mtime := hdr.ModTime.UTC()
+	atime, ctime := tarTimes(hdr, mtime)
+	xattrs := tarXattrs(hdr)
 	base := path.Base(name)
 
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		m.addEntry(&archiveEntry{
-			path:  name,
-			isDir: true,
-			label: label,
-			fi:    &ExtendedFileInfo{Name: base, Mode: os.FileMode(hdr.Mode) | os.ModeDir, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime},
+			path:   name,
+			isDir:  true,
+			label:  label,
+			xattrs: xattrs,
+			fi:     &ExtendedFileInfo{Name: base, Mode: os.FileMode(hdr.Mode) | os.ModeDir, ModTime: mtime, AccessTime: atime, ChangeTime: ctime},
 		})
 
 	case tar.TypeSymlink:
@@ -353,7 +357,8 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 			path:       name,
 			label:      label,
 			linkTarget: target,
-			fi:         &ExtendedFileInfo{Name: base, Mode: os.ModeSymlink | 0o777, Size: int64(len(target)), ModTime: mtime, AccessTime: mtime, ChangeTime: mtime},
+			xattrs:     xattrs,
+			fi:         &ExtendedFileInfo{Name: base, Mode: os.ModeSymlink | 0o777, Size: int64(len(target)), ModTime: mtime, AccessTime: atime, ChangeTime: ctime},
 		})
 
 	case tar.TypeLink:
@@ -369,9 +374,11 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 			return
 		}
 		e := &archiveEntry{
-			path:  name,
-			label: label,
-			fi:    &ExtendedFileInfo{Name: base, Mode: t.fi.Mode, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime},
+			path:   name,
+			label:  label,
+			xattrs: t.xattrs,
+			fi: &ExtendedFileInfo{Name: base, Mode: t.fi.Mode, ModTime: mtime,
+				AccessTime: t.fi.AccessTime, ChangeTime: t.fi.ChangeTime},
 		}
 		if t.fi.Mode&os.ModeSymlink != 0 {
 			// a hard link to a symlink is stored as a regular file whose
@@ -392,9 +399,10 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 	// accepted.
 	case tar.TypeReg, tar.TypeRegA, tar.TypeGNUSparse: //nolint:staticcheck
 		m.addEntry(&archiveEntry{
-			path:  name,
-			label: label,
-			fi:    &ExtendedFileInfo{Name: base, Mode: os.FileMode(hdr.Mode), Size: hdr.Size, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime},
+			path:   name,
+			label:  label,
+			xattrs: xattrs,
+			fi:     &ExtendedFileInfo{Name: base, Mode: os.FileMode(hdr.Mode), Size: hdr.Size, ModTime: mtime, AccessTime: atime, ChangeTime: ctime},
 			content: func() (io.ReadCloser, error) {
 				return arc.openContent(dataStart, uint64(hdr.Size))
 			},
@@ -403,6 +411,72 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 	default:
 		m.warn("%s: entry %q ignored, unsupported special file", label, hdr.Name)
 	}
+}
+
+// tarTimes returns the entry's access and change times as stored in the
+// archive header (PAX atime/ctime records, or STAR or GNU extended
+// fields). Archives that do not store them fall back to the modification
+// time.
+func tarTimes(hdr *tar.Header, mtime time.Time) (atime, ctime time.Time) {
+	if a := hdr.AccessTime; !a.IsZero() {
+		atime = a.UTC()
+	} else {
+		atime = mtime
+	}
+	if c := hdr.ChangeTime; !c.IsZero() {
+		ctime = c.UTC()
+	} else {
+		ctime = mtime
+	}
+	return
+}
+
+// paxXattrPrefix is the PAX record namespace that carries extended
+// attributes.
+const paxXattrPrefix = "SCHILY.xattr."
+
+// tarXattrs returns the entry's extended attributes as stored in the
+// archive's PAX records (SCHILY.xattr.*), with non-printable values
+// decoded from the PAX octal escaping. It is nil when the entry has
+// none.
+func tarXattrs(hdr *tar.Header) map[string][]byte {
+	x := make(map[string][]byte)
+	for k, v := range hdr.PAXRecords {
+		if !strings.HasPrefix(k, paxXattrPrefix) {
+			continue
+		}
+		x[k[len(paxXattrPrefix):]] = paxDecodeXattrValue(v)
+	}
+	if len(x) == 0 {
+		return nil
+	}
+	return x
+}
+
+// paxDecodeXattrValue reverses the PAX encoding of a value that contains
+// non-printable characters: the paxspec requires such values to be stored
+// as a leading backslash followed by a run of three-digit octal groups
+// (this is what GNU tar writes). A value without the leading backslash is
+// the literal value.
+func paxDecodeXattrValue(v string) []byte {
+	if len(v) == 0 || v[0] != '\\' {
+		return []byte(v)
+	}
+	s := v[1:]
+	if len(s)%3 != 0 {
+		// not an octal-encoded value after all: use the raw value
+		return []byte(v)
+	}
+	out := make([]byte, len(s)/3)
+	for i := range out {
+		b, err := strconv.ParseUint(s[i*3:i*3+3], 8, 8)
+		if err != nil {
+			// malformed octal groups: use the raw value
+			return []byte(v)
+		}
+		out[i] = byte(b)
+	}
+	return out
 }
 
 // openSingleFile indexes a standalone compressed file (a .gz or .xz that
