@@ -402,3 +402,30 @@ comparables). La dedup por contenido de restic evita reescribir datos repetidos.
 - QA: gofmt/vet limpios, `go test -race` fs+cmd/restic verde
   (fs 3.4 s, cmd/restic 106.6 s), golangci-lint 0 issues, RST sin
   errores nuevos, cross-builds windows/darwin ok.
+
+### A12 — resumen/verbose del indexado
+
+- Qué hice: observabilidad del indexado de `--migrate`. `MigrateFS` ahora
+  lleva `archiveInfos []ArchiveInfo` (Path, Label, Indexed, Skipped) y lo
+  expone con `Archives()`. Los indexadores (`indexZipEntry`,
+  `indexTarEntry`, `indexSevenZipEntry`) devuelven `bool` (true si la
+  entrada quedó indexada, false si se saltó con warning) y los `open*`
+  (y `openSingleFile`) van incrementando los contadores; también los
+  constructores `NewZipMulti`/`NewSevenZipMulti` alimentan su
+  `archiveInfos`. `cmd_backup.go` imprime tras `NewMigrate`:
+  - `-v`: una línea por archive con el formato detectado y los contadores
+    (`archive data.tar: tar, 42 entries indexed, 3 skipped`).
+  - Por defecto (solo si hay saltos): total
+    `N archive entries skipped (see warnings)`.
+  - Con `--json` no se imprime nada (estilo de los mensajes existentes).
+  Ayuda: la `Long` de `backup` ganaba la sección "ARCHIVES (--migrate)"
+  con ejemplo de uso y resumen del comportamiento (la flag ya aparecía en
+  la lista de flags de `backup --help`).
+- Tests: `TestMigrateArchiveInfo` (zip + tar.gz con una entrada que escapa
+  la raíz; comprueba orden, labels "zip"/"tar.gz" y contadores 1/0 y
+  2/1). E2E manual con binario: por defecto solo el total de saltos; con
+  `-v` las líneas por archive.
+- Docs/changelog: bullet en `040_backup.rst` (resumen por archive con `-v`
+  + total de saltos) y frase en el changelog.
+- QA: gofmt/vet limpios, tests fs+cmd/restic, `-race` verde, lint 0, RST ok,
+  cross-builds ok.

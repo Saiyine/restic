@@ -12,7 +12,10 @@ magic bytes and, for tar, by sniffing its content). The archives are never extra
 contents are decompressed on the fly and streamed to the repository,
 so memory usage stays bounded no matter how large the archives are.
 `restore` reproduces the entries byte for byte, including
-permissions and modification times. Access and change times are
+permissions and modification times. With `-v`, `backup` prints one
+line per archive with the detected format and the number of entries
+indexed and skipped, and prints a total of the skipped entries (each
+skip is also reported with its own warning). Access and change times are
 also kept when the archive stores them (PAX `atime`/`ctime` records
 in tar, the `0x5455` extended-timestamp extra field in zip), and
 tar entries with PAX `SCHILY.xattr.*` records are backed up

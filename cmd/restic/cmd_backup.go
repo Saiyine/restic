@@ -43,6 +43,22 @@ func newBackupCommand(globalOptions *global.Options) *cobra.Command {
 The "backup" command creates a new snapshot and saves the files and directories
 given as the arguments.
 
+ARCHIVES (--migrate)
+====================
+
+The "--migrate" option backs up the contents of zip, 7z and tar archives in
+place, without extracting them to disk:
+
+    restic backup --migrate data.zip --migrate data.tar.gz
+
+The entries are stored in the snapshot with the paths they have inside the
+archives, and archives of different formats can be combined freely in a
+single backup (each archive's format is detected from its content). Entry
+contents are decompressed on the fly while the backup runs. A tar archive
+may be plain or compressed with gzip, xz, bzip2 or zstd; a compressed file
+that does not contain a tar archive is backed up as a single file named
+after the archive (e.g. "report.gz" becomes "/report").
+
 EXIT STATUS
 ===========
 
@@ -565,6 +581,21 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		defer func() {
 			_ = migrateFS.Close()
 		}()
+
+		// summarize the indexing of the archives: one line per archive
+		// with the detected format and the entry counts (verbose), plus
+		// a total of the skipped entries (always, when any)
+		if !gopts.JSON {
+			var indexed, skipped int
+			for _, ai := range migrateFS.Archives() {
+				printer.V("archive %s: %s, %d entries indexed, %d skipped\n", ai.Path, ai.Label, ai.Indexed, ai.Skipped)
+				indexed += ai.Indexed
+				skipped += ai.Skipped
+			}
+			if skipped > 0 {
+				printer.P("%d archive entries skipped (see warnings)\n", skipped)
+			}
+		}
 	}
 
 	success := true

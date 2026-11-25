@@ -840,6 +840,10 @@ Notes and limitations:
   ``..`` components are re-rooted inside the virtual filesystem.
 * The ``--exclude``, ``--tag``, ``--time`` and ``--dry-run`` options work as
   usual with ``--migrate``.
+* Each skipped entry is reported with a warning; with ``-v``, the backup
+  additionally prints one line per archive with the detected format and
+  the number of entries indexed and skipped, and prints a total of the
+  skipped entries even without ``-v`` when there are any.
 
 Tags for backup
 ***************
