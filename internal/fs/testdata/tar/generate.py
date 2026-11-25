@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """Regenerates the tar fixtures in this directory.
 
-Pure Python (tarfile + gzip + lzma); no external tools are required. The
-fixtures are deterministic: all mtimes are fixed to whole seconds, all
-modes are set explicitly, and the gzip header timestamp is pinned.
+The fixtures are deterministic: all mtimes are fixed to whole seconds, all
+modes are set explicitly, and the gzip header timestamp is pinned. gzip,
+lzma and bz2 come from the Python standard library; zstd compression
+additionally needs the ``zstandard`` package (``pip install zstandard``) —
+the committed ``*.zst`` fixtures are regenerated only when it is available.
 
 Run from anywhere:  python3 generate.py
 """
 
+import bz2
 import gzip
 import io
 import lzma
 import os
 import tarfile
 from datetime import datetime, timezone
+
+try:
+    import zstandard as _zstd
+except ImportError:  # pragma: no cover - only needed to regenerate *.zst
+    _zstd = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,6 +62,20 @@ def write_gz(data, name, mtime=MTIME_A):
 def write_xz(data, name):
     with lzma.open(name, "wb", format=lzma.FORMAT_XZ) as f:
         f.write(data)
+
+
+def write_bz2(data, name):
+    with bz2.open(name, "wb", compresslevel=9) as f:
+        f.write(data)
+
+
+def write_zst(data, name):
+    if _zstd is None:
+        raise RuntimeError("zstandard is required to regenerate *.zst: pip install zstandard")
+    cctx = _zstd.ZstdCompressor(level=19)
+    with open(name, "wb") as f:
+        with cctx.stream_writer(f, closefd=True) as w:
+            w.write(data)
 
 
 def gen_basic():
@@ -104,10 +126,40 @@ def gen_xz():
     write_xz(data, path)
 
 
+def gen_bz2():
+    """bzip2-compressed tar."""
+    path = os.path.join(HERE, "bz2.tar.bz2")
+    make_tar([
+        (info("data.txt", len(b"bz2 data here\n"), 0o644, MTIME_A), b"bz2 data here\n"),
+        (info("sub/", 0, 0o755, MTIME_A, type=tarfile.DIRTYPE), None),
+        (info("sub/inner.txt", 11, 0o644, MTIME_B), b"inner data\n"),
+    ], path, format=tarfile.PAX_FORMAT)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    write_bz2(data, path)
+
+
+def gen_zst():
+    """zstd-compressed tar."""
+    path = os.path.join(HERE, "zst.tar.zst")
+    make_tar([
+        (info("data.txt", len(b"zst data here\n"), 0o644, MTIME_A), b"zst data here\n"),
+        (info("sub/", 0, 0o755, MTIME_A, type=tarfile.DIRTYPE), None),
+        (info("sub/inner.txt", 11, 0o644, MTIME_B), b"inner data\n"),
+    ], path, format=tarfile.PAX_FORMAT)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    write_zst(data, path)
+
+
 def gen_standalone():
-    """Standalone .gz/.xz files (no tar inside): one virtual file each."""
+    """Standalone .gz/.xz/.bz2/.zst files (no tar inside): one virtual file each."""
     write_gz(b"gzip standalone content\n", os.path.join(HERE, "alpha.gz"))
     write_xz(b"xz standalone content\n", os.path.join(HERE, "beta.xz"))
+    write_bz2(b"bzip2 standalone content\n", os.path.join(HERE, "gamma.bz2"))
+    write_zst(b"zstd standalone content\n", os.path.join(HERE, "delta.zst"))
 
 
 def gen_dups():
@@ -142,6 +194,8 @@ def main():
     gen_basic()
     gen_gz()
     gen_xz()
+    gen_bz2()
+    gen_zst()
     gen_standalone()
     gen_dups()
     gen_empty()

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/restic/restic/internal/test"
 	"github.com/ulikunitz/xz"
 )
@@ -31,7 +32,8 @@ type tarTestEntry struct {
 }
 
 // writeTestTar writes a tar archive to path, optionally wrapped in gzip
-// ("gz") and/or xz ("xz"). Entry mtimes default to modTimeA.
+// ("gz"), xz ("xz") or zstd ("zst"). (bzip2 has no writer in the standard
+// library; bz2 fixtures are committed.) Entry mtimes default to modTimeA.
 func writeTestTar(t testing.TB, path, wrap string, entries []tarTestEntry) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -70,16 +72,21 @@ func writeTestTar(t testing.TB, path, wrap string, entries []tarTestEntry) {
 	test.OK(t, err)
 	var out io.Writer = f
 	var closers []io.Closer
-	if strings.Contains(wrap, "gz") {
+	switch {
+	case strings.Contains(wrap, "gz"):
 		gz := gzip.NewWriter(f)
 		out = gz
 		closers = append(closers, gz)
-	}
-	if strings.Contains(wrap, "xz") {
+	case strings.Contains(wrap, "xz"):
 		xzw, err := xz.NewWriter(f)
 		test.OK(t, err)
 		out = xzw
 		closers = append(closers, xzw)
+	case strings.Contains(wrap, "zst"):
+		zsw, err := zstd.NewWriter(f)
+		test.OK(t, err)
+		out = zsw
+		closers = append(closers, zsw)
 	}
 	_, err = io.Copy(out, &buf)
 	test.OK(t, err)
@@ -208,6 +215,44 @@ func TestTarXz(t *testing.T) {
 	test.Equals(t, modTimeB, fi.ModTime)
 }
 
+// TestTarBzip2 verifies a bzip2-compressed tar.
+func TestTarBzip2(t *testing.T) {
+	var warnings []string
+	m := openTestMigrate(t, []string{filepath.Join(tarTestdata, "bz2.tar.bz2")}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	test.Equals(t, "bz2 data here\n", readWholeFile(t, m, "/data.txt"))
+
+	fi, err := m.Lstat("/sub")
+	test.OK(t, err)
+	test.Assert(t, fi.Mode.IsDir(), "expected dir, got %v", fi.Mode)
+	test.Equals(t, os.FileMode(0o755), fi.Mode.Perm())
+
+	test.Equals(t, "inner data\n", readWholeFile(t, m, "/sub/inner.txt"))
+	fi, err = m.Lstat("/sub/inner.txt")
+	test.OK(t, err)
+	test.Equals(t, modTimeB, fi.ModTime)
+}
+
+// TestTarZstd verifies a zstd-compressed tar.
+func TestTarZstd(t *testing.T) {
+	var warnings []string
+	m := openTestMigrate(t, []string{filepath.Join(tarTestdata, "zst.tar.zst")}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	test.Equals(t, "zst data here\n", readWholeFile(t, m, "/data.txt"))
+
+	fi, err := m.Lstat("/sub")
+	test.OK(t, err)
+	test.Assert(t, fi.Mode.IsDir(), "expected dir, got %v", fi.Mode)
+	test.Equals(t, os.FileMode(0o755), fi.Mode.Perm())
+
+	test.Equals(t, "inner data\n", readWholeFile(t, m, "/sub/inner.txt"))
+	fi, err = m.Lstat("/sub/inner.txt")
+	test.OK(t, err)
+	test.Equals(t, modTimeB, fi.ModTime)
+}
+
 // TestTarStandaloneGz verifies that a .gz file without a tar inside is
 // backed up as a single virtual file named after the archive, with the mtime
 // of the gzip header.
@@ -251,6 +296,48 @@ func TestTarStandaloneXz(t *testing.T) {
 	test.Equals(t, ost.ModTime().UTC(), fi.ModTime)
 
 	test.Equals(t, content, readWholeFile(t, m, "/beta"))
+}
+
+// TestTarStandaloneBz2 verifies the same for a .bz2 file: the mtime is that
+// of the file itself, as the bzip2 format stores no mtime.
+func TestTarStandaloneBz2(t *testing.T) {
+	var warnings []string
+	m := openTestMigrate(t, []string{filepath.Join(tarTestdata, "gamma.bz2")}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	const content = "bzip2 standalone content\n"
+	fi, err := m.Lstat("/gamma")
+	test.OK(t, err)
+	test.Equals(t, "gamma", fi.Name)
+	test.Equals(t, os.FileMode(0o644), fi.Mode)
+	test.Equals(t, int64(len(content)), fi.Size)
+
+	ost, err := os.Stat(filepath.Join(tarTestdata, "gamma.bz2"))
+	test.OK(t, err)
+	test.Equals(t, ost.ModTime().UTC(), fi.ModTime)
+
+	test.Equals(t, content, readWholeFile(t, m, "/gamma"))
+}
+
+// TestTarStandaloneZst verifies the same for a .zst file: the mtime is that
+// of the file itself, as the zstd format stores no mtime.
+func TestTarStandaloneZst(t *testing.T) {
+	var warnings []string
+	m := openTestMigrate(t, []string{filepath.Join(tarTestdata, "delta.zst")}, &warnings)
+	test.Equals(t, 0, len(warnings))
+
+	const content = "zstd standalone content\n"
+	fi, err := m.Lstat("/delta")
+	test.OK(t, err)
+	test.Equals(t, "delta", fi.Name)
+	test.Equals(t, os.FileMode(0o644), fi.Mode)
+	test.Equals(t, int64(len(content)), fi.Size)
+
+	ost, err := os.Stat(filepath.Join(tarTestdata, "delta.zst"))
+	test.OK(t, err)
+	test.Equals(t, ost.ModTime().UTC(), fi.ModTime)
+
+	test.Equals(t, content, readWholeFile(t, m, "/delta"))
 }
 
 // TestTarMultiDuplicateLastWins verifies that a path present in two tar
@@ -330,6 +417,30 @@ func TestTarCorruptXz(t *testing.T) {
 
 	_, err = NewMigrate([]string{dst}, func(string, ...any) {})
 	test.Assert(t, err != nil, "expected an error for a corrupt xz stream")
+}
+
+// TestTarCorruptBz2 verifies the same for a truncated .bz2 file.
+func TestTarCorruptBz2(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "corrupt.bz2")
+	data, err := os.ReadFile(filepath.Join(tarTestdata, "gamma.bz2"))
+	test.OK(t, err)
+	test.OK(t, os.WriteFile(dst, data[:len(data)/2], 0o644))
+
+	_, err = NewMigrate([]string{dst}, func(string, ...any) {})
+	test.Assert(t, err != nil, "expected an error for a corrupt bzip2 stream")
+}
+
+// TestTarCorruptZst verifies the same for a truncated .zst file.
+func TestTarCorruptZst(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "corrupt.zst")
+	data, err := os.ReadFile(filepath.Join(tarTestdata, "delta.zst"))
+	test.OK(t, err)
+	test.OK(t, os.WriteFile(dst, data[:len(data)/2], 0o644))
+
+	_, err = NewMigrate([]string{dst}, func(string, ...any) {})
+	test.Assert(t, err != nil, "expected an error for a corrupt zstd stream")
 }
 
 // TestTarArchiveSlip verifies that unsafe entry names are either re-rooted
@@ -441,6 +552,16 @@ func TestTarPartialRead(t *testing.T) {
 			abandoned: "/data.txt",
 			check:     []string{"/data.txt", "/target.txt"},
 		},
+		{
+			path:      filepath.Join(tarTestdata, "bz2.tar.bz2"),
+			abandoned: "/data.txt",
+			check:     []string{"/data.txt", "/sub/inner.txt"},
+		},
+		{
+			path:      filepath.Join(tarTestdata, "zst.tar.zst"),
+			abandoned: "/data.txt",
+			check:     []string{"/data.txt", "/sub/inner.txt"},
+		},
 	} {
 		t.Run(filepath.Base(tc.path), func(t *testing.T) {
 			var warnings []string
@@ -491,9 +612,10 @@ func TestTarNoDiskAccess(t *testing.T) {
 	test.Equals(t, 0, len(emptyDir), "files were written to TMPDIR")
 }
 
-// TestTarProbeFormats verifies the format detection: plain tar, gzipped and
-// xz-compressed tar are indexed as archives, while gzipped and xz-compressed
-// files without a tar inside are indexed as a single virtual file.
+// TestTarProbeFormats verifies the format detection: plain tar and tar
+// compressed with gzip, xz, bzip2 or zstd are indexed as archives, while
+// compressed files without a tar inside are indexed as a single virtual
+// file.
 func TestTarProbeFormats(t *testing.T) {
 	cases := []struct {
 		path string
@@ -502,8 +624,12 @@ func TestTarProbeFormats(t *testing.T) {
 		{filepath.Join(tarTestdata, "basic.tar"), "/top.txt"},
 		{filepath.Join(tarTestdata, "gz.tar.gz"), "/data.txt"},
 		{filepath.Join(tarTestdata, "xz.tar.xz"), "/data.txt"},
+		{filepath.Join(tarTestdata, "bz2.tar.bz2"), "/data.txt"},
+		{filepath.Join(tarTestdata, "zst.tar.zst"), "/data.txt"},
 		{filepath.Join(tarTestdata, "alpha.gz"), "/alpha"},
 		{filepath.Join(tarTestdata, "beta.xz"), "/beta"},
+		{filepath.Join(tarTestdata, "gamma.bz2"), "/gamma"},
+		{filepath.Join(tarTestdata, "delta.zst"), "/delta"},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.path), func(t *testing.T) {
