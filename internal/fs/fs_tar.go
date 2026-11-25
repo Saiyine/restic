@@ -286,7 +286,7 @@ func (c *countReader) Read(p []byte) (int, error) {
 // walked once to learn the entries' positions in the (decompressed)
 // stream, which also validates the stream; the entries' content is
 // decompressed on the fly, one stream per opened entry.
-func (m *MigrateFS) openTarArchive(path string, comp tarCompression) error {
+func (m *MigrateFS) openTarArchive(path string, comp tarCompression, info *ArchiveInfo) error {
 	arc := &tarArchive{path: path, comp: comp}
 	m.addCloser(arc.closeStream)
 
@@ -314,20 +314,25 @@ func (m *MigrateFS) openTarArchive(path string, comp tarCompression) error {
 		// counter.n now points at the start of this entry's content
 		// (the header and any preceding PAX/GNU metadata blocks have been
 		// consumed)
-		m.indexTarEntry(arc, hdr, counter.n)
+		if m.indexTarEntry(arc, hdr, counter.n) {
+			info.Indexed++
+		} else {
+			info.Skipped++
+		}
 	}
 	return rc.Close()
 }
 
 // indexTarEntry indexes one tar entry. Entries whose names cannot be made
 // safe (escaping the virtual root, NUL bytes, ...) or that are of an
-// unsupported type are skipped with a warning.
-func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart uint64) {
+// unsupported type are skipped with a warning. It reports whether the entry
+// was indexed.
+func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart uint64) bool {
 	label := tarLabel(arc.comp)
 	name, ok := archiveCleanEntryName(hdr.Name)
 	if !ok {
 		m.warn("%s: entry %q ignored, unsafe or invalid path", label, hdr.Name)
-		return
+		return false
 	}
 
 	mtime := hdr.ModTime.UTC()
@@ -337,7 +342,7 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		m.addEntry(&archiveEntry{
+		return m.addEntry(&archiveEntry{
 			path:   name,
 			isDir:  true,
 			label:  label,
@@ -351,9 +356,9 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 		target := hdr.Linkname
 		if target == "" {
 			m.warn("%s: entry %q ignored, empty symlink target", label, hdr.Name)
-			return
+			return false
 		}
-		m.addEntry(&archiveEntry{
+		return m.addEntry(&archiveEntry{
 			path:       name,
 			label:      label,
 			linkTarget: target,
@@ -366,12 +371,12 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 		tname, ok := archiveCleanEntryName(hdr.Linkname)
 		if !ok {
 			m.warn("%s: entry %q ignored, unsafe or invalid link target", label, hdr.Name)
-			return
+			return false
 		}
 		t, ok := m.entries[tname]
 		if !ok || t.isDir {
 			m.warn("%s: entry %q ignored, hard link target %q not found", label, hdr.Name, hdr.Linkname)
-			return
+			return false
 		}
 		e := &archiveEntry{
 			path:   name,
@@ -392,13 +397,13 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 			e.fi.Size = t.fi.Size
 			e.content = t.content
 		}
-		m.addEntry(e)
+		return m.addEntry(e)
 
 	// TypeRegA is the legacy '1' regular-file type: deprecated by
 	// archive/tar but still present in old tar archives, so it must be
 	// accepted.
 	case tar.TypeReg, tar.TypeRegA, tar.TypeGNUSparse: //nolint:staticcheck
-		m.addEntry(&archiveEntry{
+		return m.addEntry(&archiveEntry{
 			path:   name,
 			label:  label,
 			xattrs: xattrs,
@@ -410,6 +415,7 @@ func (m *MigrateFS) indexTarEntry(arc *tarArchive, hdr *tar.Header, dataStart ui
 
 	default:
 		m.warn("%s: entry %q ignored, unsupported special file", label, hdr.Name)
+		return false
 	}
 }
 
@@ -479,11 +485,11 @@ func paxDecodeXattrValue(v string) []byte {
 	return out
 }
 
-// openSingleFile indexes a standalone compressed file (a .gz or .xz that
-// does not contain a tar) as a single virtual file named after the archive
-// (e.g. "report.gz" becomes "/report"). A full decompression pass measures
-// the size of the uncompressed data and validates the stream.
-func (m *MigrateFS) openSingleFile(path string, comp tarCompression) error {
+// openSingleFile indexes a standalone compressed file (a .gz, .xz, .bz2 or
+// .zst that does not contain a tar) as a single virtual file named after the
+// archive (e.g. "report.gz" becomes "/report"). A full decompression pass
+// measures the size of the uncompressed data and validates the stream.
+func (m *MigrateFS) openSingleFile(path string, comp tarCompression, info *ArchiveInfo) error {
 	label := singleLabel(comp)
 
 	arc := &tarArchive{path: path, comp: comp}
@@ -511,14 +517,18 @@ func (m *MigrateFS) openSingleFile(path string, comp tarCompression) error {
 	}
 
 	name := singleFileName(path)
-	m.addEntry(&archiveEntry{
+	if m.addEntry(&archiveEntry{
 		path:  "/" + name,
 		label: label,
 		fi:    &ExtendedFileInfo{Name: name, Mode: 0o644, Size: n, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime},
 		content: func() (io.ReadCloser, error) {
 			return arc.openContent(0, uint64(n))
 		},
-	})
+	}) {
+		info.Indexed++
+	} else {
+		info.Skipped++
+	}
 	return nil
 }
 

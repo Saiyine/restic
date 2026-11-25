@@ -91,15 +91,12 @@ func NewZipMulti(zipPaths []string, warnf func(format string, args ...any)) (*Mi
 
 	m := newMigrateFS(warnf, 0)
 	for _, p := range zipPaths {
-		zr, err := zip.OpenReader(p)
-		if err != nil {
+		info := ArchiveInfo{Path: p, Label: "zip"}
+		if err := m.openZipArchive(p, &info); err != nil {
 			_ = m.Close()
 			return nil, err
 		}
-		m.addCloser(zr.Close)
-		for _, fh := range zr.File {
-			m.indexZipEntry(fh)
-		}
+		m.archiveInfos = append(m.archiveInfos, info)
 	}
 
 	m.finalize()
@@ -108,14 +105,18 @@ func NewZipMulti(zipPaths []string, warnf func(format string, args ...any)) (*Mi
 
 // openZipArchive opens the zip archive at path and indexes its entries into
 // m. Used by NewMigrate, which probes the format first.
-func (m *MigrateFS) openZipArchive(path string) error {
+func (m *MigrateFS) openZipArchive(path string, info *ArchiveInfo) error {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return err
 	}
 	m.addCloser(zr.Close)
 	for _, fh := range zr.File {
-		m.indexZipEntry(fh)
+		if m.indexZipEntry(fh) {
+			info.Indexed++
+		} else {
+			info.Skipped++
+		}
 	}
 	return nil
 }
@@ -123,21 +124,21 @@ func (m *MigrateFS) openZipArchive(path string) error {
 // indexZipEntry validates one zip entry and indexes it if usable. Entries
 // whose names cannot be made safe (escaping the virtual root, NUL bytes,
 // ...), or that are encrypted or use an unsupported compression method, are
-// skipped with a warning.
-func (m *MigrateFS) indexZipEntry(fh *zip.File) {
+// skipped with a warning. It reports whether the entry was indexed.
+func (m *MigrateFS) indexZipEntry(fh *zip.File) bool {
 	name, ok := zipCleanEntryName(fh.Name, fh.NonUTF8)
 	if !ok {
 		m.warn("zip: entry %q ignored, unsafe or invalid path", fh.Name)
-		return
+		return false
 	}
 
 	if fh.Flags&zipEncryptedFlag != 0 {
 		m.warn("zip: entry %q ignored, entry is encrypted", fh.Name)
-		return
+		return false
 	}
 	if fh.Method != zip.Store && fh.Method != zip.Deflate {
 		m.warn("zip: entry %q ignored, unsupported compression method %d", fh.Name, fh.Method)
-		return
+		return false
 	}
 
 	mode := fh.Mode()
@@ -168,7 +169,7 @@ func (m *MigrateFS) indexZipEntry(fh *zip.File) {
 		target, err := readLinkTarget(fh.UncompressedSize64, fh.Open)
 		if err != nil {
 			m.warn("zip: entry %q ignored: %v", fh.Name, err)
-			return
+			return false
 		}
 		e.linkTarget = target
 		e.fi.Mode = os.ModeSymlink | 0o777
@@ -181,7 +182,7 @@ func (m *MigrateFS) indexZipEntry(fh *zip.File) {
 		}
 	}
 
-	m.addEntry(e)
+	return m.addEntry(e)
 }
 
 // zipEntryMode returns the permission bits to store for an entry. Archives

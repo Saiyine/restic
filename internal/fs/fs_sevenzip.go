@@ -42,10 +42,12 @@ func NewSevenZipMulti(paths []string, warnf func(format string, args ...any)) (*
 
 	m := newMigrateFS(warnf, 0)
 	for _, p := range paths {
-		if err := m.openSevenZipArchive(p); err != nil {
+		info := ArchiveInfo{Path: p, Label: "7z"}
+		if err := m.openSevenZipArchive(p, &info); err != nil {
 			_ = m.Close()
 			return nil, err
 		}
+		m.archiveInfos = append(m.archiveInfos, info)
 	}
 
 	m.finalize()
@@ -54,40 +56,45 @@ func NewSevenZipMulti(paths []string, warnf func(format string, args ...any)) (*
 
 // openSevenZipArchive opens the 7z archive at path and indexes its entries
 // into m. Used by NewMigrate, which probes the format first.
-func (m *MigrateFS) openSevenZipArchive(path string) error {
+func (m *MigrateFS) openSevenZipArchive(path string, info *ArchiveInfo) error {
 	zr, err := sevenzip.OpenReader(path)
 	if err != nil {
 		return err
 	}
 	m.addCloser(zr.Close)
-	m.indexSevenZip(zr)
+	m.indexSevenZip(zr, info)
 	return nil
 }
 
 // indexSevenZip indexes all entries of one 7z archive.
-func (m *MigrateFS) indexSevenZip(zr *sevenzip.ReadCloser) {
+func (m *MigrateFS) indexSevenZip(zr *sevenzip.ReadCloser, info *ArchiveInfo) {
 	streams := make(map[int]*sevenZipStreamState, len(zr.File))
 	for _, f := range zr.File {
-		m.indexSevenZipEntry(f, streams)
+		if m.indexSevenZipEntry(f, streams) {
+			info.Indexed++
+		} else {
+			info.Skipped++
+		}
 	}
 }
 
 // indexSevenZipEntry validates one 7z entry and indexes it if usable.
 // Entries whose names cannot be made safe (escaping the virtual root, NUL
 // bytes, ...) or that belong to an unreadable stream (encrypted, unsupported
-// codec, ...) are skipped with a warning.
-func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZipStreamState) {
+// codec, ...) are skipped with a warning. It reports whether the entry was
+// indexed.
+func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZipStreamState) bool {
 	name, ok := archiveCleanEntryName(f.Name)
 	if !ok {
 		m.warn("7z: entry %q ignored, unsafe or invalid path", f.Name)
-		return
+		return false
 	}
 
 	mode := f.Mode()
 	switch {
 	case mode&os.ModeDevice != 0, mode&os.ModeNamedPipe != 0, mode&os.ModeSocket != 0:
 		m.warn("7z: entry %q ignored, unsupported special file", f.Name)
-		return
+		return false
 	}
 
 	isDir := mode.IsDir() || strings.HasSuffix(f.Name, "/")
@@ -108,8 +115,7 @@ func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZ
 
 	if isDir {
 		e.fi.Mode = mode
-		m.addEntry(e)
-		return
+		return m.addEntry(e)
 	}
 
 	// A 7z folder (stream) may hold several entries and is decompressed
@@ -123,7 +129,7 @@ func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZ
 	}
 	if st.err != nil {
 		m.warn("7z: entry %q ignored: %v", f.Name, st.err)
-		return
+		return false
 	}
 
 	if isSymlink {
@@ -133,7 +139,7 @@ func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZ
 		if err != nil {
 			m.failSevenZipStream(st, err)
 			m.warn("7z: entry %q ignored: %v", f.Name, sevenZipStreamErrorMessage(st.err))
-			return
+			return false
 		}
 		e.linkTarget = target
 		e.fi.Mode = os.ModeSymlink | 0o777
@@ -147,13 +153,13 @@ func (m *MigrateFS) indexSevenZipEntry(f *sevenzip.File, streams map[int]*sevenZ
 			if err := peekSevenZipEntry(f); err != nil {
 				m.failSevenZipStream(st, err)
 				m.warn("7z: entry %q ignored: %v", f.Name, sevenZipStreamErrorMessage(st.err))
-				return
+				return false
 			}
 			st.verified = true
 		}
 	}
 
-	m.addEntry(e)
+	return m.addEntry(e)
 }
 
 // failSevenZipStream records a validation error for the stream, using a

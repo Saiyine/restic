@@ -62,16 +62,28 @@ type archiveEntry struct {
 	xattrs     map[string][]byte             // extended attributes, when the archive format stores them
 }
 
+// ArchiveInfo describes one indexed archive: its path, the format label
+// detected for it, and how many of its entries were indexed into the
+// virtual filesystem or skipped (with a warning).
+type ArchiveInfo struct {
+	Path    string
+	Label   string // "zip", "7z", "tar", "tar.gz", ...
+	Indexed int
+	Skipped int
+}
+
 // MigrateFS is a read-only filesystem view over the entries of one or more
-// archive files (zip and/or 7z). It implements FS so that the archiver can
-// back up the archives' contents in place: entry content is decompressed on
-// the fly and nothing is ever extracted to disk. Concurrent OpenFile calls
-// are safe: every opened file gets its own decompressor over the
-// (concurrency-safe) access of the underlying archive files, and no state is
-// shared between Files.
+// archive files (zip, 7z and tar, in any combination, plus standalone
+// compressed files). It implements FS so that the archiver can back up the
+// archives' contents in place: entry content is decompressed on the fly and
+// nothing is ever extracted to disk. Concurrent OpenFile calls are safe:
+// every opened file gets its own decompressor over the (concurrency-safe)
+// access of the underlying archive files, and no state is shared between
+// Files.
 type MigrateFS struct {
-	entries  map[string]*archiveEntry
-	children map[string][]string // dir path -> sorted child names
+	entries      map[string]*archiveEntry
+	children     map[string][]string // dir path -> sorted child names
+	archiveInfos []ArchiveInfo
 
 	warn    func(format string, args ...any)
 	closers []func() error
@@ -414,24 +426,36 @@ func NewMigrate(archivePaths []string, warnf func(format string, args ...any)) (
 	m := newMigrateFS(warnf, 0)
 	for i, p := range archivePaths {
 		var err error
+		var info ArchiveInfo
 		switch infos[i].kind {
 		case kindZip:
-			err = m.openZipArchive(p)
+			info = ArchiveInfo{Path: p, Label: "zip"}
+			err = m.openZipArchive(p, &info)
 		case kindSevenZip:
-			err = m.openSevenZipArchive(p)
+			info = ArchiveInfo{Path: p, Label: "7z"}
+			err = m.openSevenZipArchive(p, &info)
 		case kindTar:
-			err = m.openTarArchive(p, infos[i].comp)
+			info = ArchiveInfo{Path: p, Label: tarLabel(infos[i].comp)}
+			err = m.openTarArchive(p, infos[i].comp, &info)
 		case kindSingle:
-			err = m.openSingleFile(p, infos[i].comp)
+			info = ArchiveInfo{Path: p, Label: singleLabel(infos[i].comp)}
+			err = m.openSingleFile(p, infos[i].comp, &info)
 		}
 		if err != nil {
 			_ = m.Close()
 			return nil, err
 		}
+		m.archiveInfos = append(m.archiveInfos, info)
 	}
 
 	m.finalize()
 	return m, nil
+}
+
+// Archives returns the indexed archives in the order they were given to
+// NewMigrate, with their entry and skip counts.
+func (m *MigrateFS) Archives() []ArchiveInfo {
+	return m.archiveInfos
 }
 
 // OpenFile implements FS.
